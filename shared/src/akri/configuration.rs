@@ -103,7 +103,13 @@ pub enum BrokerSpec {
 /// is created.
 #[derive(CustomResource, Serialize, Deserialize, Clone, Debug, JsonSchema)]
 // group = API_NAMESPACE and version = API_VERSION
-#[kube(group = "akri.sh", version = "v0", kind = "Configuration", namespaced)]
+#[kube(
+    group = "akri.sh",
+    version = "v0",
+    kind = "Configuration",
+    namespaced,
+    category = "all"
+)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigurationSpec {
     /// This defines the `DiscoveryHandler` that should be used to
@@ -151,9 +157,9 @@ pub struct ConfigurationSpec {
     pub broker_properties: HashMap<String, String>,
 }
 
-fn immutable_dh_info(gen: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
+fn immutable_dh_info(r#gen: &mut schemars::r#gen::SchemaGenerator) -> schemars::schema::Schema {
     let mut schema: schemars::schema::SchemaObject =
-        <DiscoveryHandlerInfo>::json_schema(gen).into();
+        <DiscoveryHandlerInfo>::json_schema(r#gen).into();
     schema.extensions.insert(
         "x-kubernetes-validations".to_owned(),
         serde_json::from_str(r#"[{"message": "Value is immutable", "rule": "self == oldSelf"}]"#)
@@ -186,14 +192,11 @@ pub async fn get_configurations(kube_client: &Client) -> Result<ConfigurationLis
             Ok(configurations_retrieved)
         }
         Err(kube::Error::Api(ae)) => {
-            log::trace!(
-                "get_configurations kube_client.request returned kube error: {:?}",
-                ae
-            );
+            log::trace!("get_configurations kube_client.request returned kube error: {ae:?}");
             Err(ae.into())
         }
         Err(e) => {
-            log::trace!("get_configurations kube_client.request error: {:?}", e);
+            log::trace!("get_configurations kube_client.request error: {e:?}");
             Err(e.into())
         }
     }
@@ -225,7 +228,7 @@ pub async fn find_configuration(
     log::trace!("find_configuration enter");
     let configurations_client: Api<Configuration> = Api::namespaced(kube_client.clone(), namespace);
 
-    log::trace!("find_configuration getting instance with name {}", name);
+    log::trace!("find_configuration getting instance with name {name}");
 
     match configurations_client.get(name).await {
         Ok(configuration_retrieved) => {
@@ -234,14 +237,11 @@ pub async fn find_configuration(
         }
         Err(e) => match e {
             kube::Error::Api(ae) => {
-                log::trace!(
-                    "find_configuration kube_client.request returned kube error: {:?}",
-                    ae
-                );
+                log::trace!("find_configuration kube_client.request returned kube error: {ae:?}");
                 Err(anyhow::anyhow!(ae))
             }
             _ => {
-                log::trace!("find_configuration kube_client.request error: {:?}", e);
+                log::trace!("find_configuration kube_client.request error: {e:?}");
                 Err(anyhow::anyhow!(e))
             }
         },

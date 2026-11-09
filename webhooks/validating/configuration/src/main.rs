@@ -1,5 +1,6 @@
-use actix_web::{post, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{App, HttpResponse, HttpServer, Responder, post, web};
 use akri_shared::akri::configuration::Configuration;
+use akri_udev::discovery_handler::UdevDiscoveryDetails;
 use clap::Arg;
 use k8s_openapi::apimachinery::pkg::runtime::RawExtension;
 use openapi::models::{
@@ -7,7 +8,7 @@ use openapi::models::{
     V1AdmissionReview as AdmissionReview, V1Status as Status,
 };
 use openssl::ssl::{SslAcceptor, SslAcceptorBuilder, SslFiletype, SslMethod};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn get_builder(key: &str, crt: &str) -> SslAcceptorBuilder {
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
@@ -28,10 +29,9 @@ fn check(
         serde_json::Value::Object(o) => {
             for (key, value) in o {
                 if let Err(e) = check(value, &deserialized[key]) {
-                    return Err(None.ok_or(format!(
-                        "input key ({:?}) not equal to parsed: ({:?})",
-                        key, e
-                    ))?);
+                    return Err(
+                        None.ok_or(format!("input key ({key:?}) not equal to parsed: ({e:?})"))?
+                    );
                 }
             }
             Ok(())
@@ -40,8 +40,7 @@ fn check(
             for (pos, _e) in s.iter().enumerate() {
                 if let Err(e) = check(&s[pos], &deserialized[pos]) {
                     return Err(None.ok_or(format!(
-                        "input index ({:?}) not equal to parsed: ({:?})",
-                        pos, e
+                        "input index ({pos:?}) not equal to parsed: ({e:?})"
                     ))?);
                 }
             }
@@ -50,47 +49,43 @@ fn check(
         serde_json::Value::String(s) => match deserialized {
             serde_json::Value::String(ds) => {
                 if s != ds {
-                    Err(None.ok_or(format!("input ({:?}) not equal to parsed ({:?})", s, ds))?)
+                    Err(None.ok_or(format!("input ({s:?}) not equal to parsed ({ds:?})"))?)
                 } else {
                     Ok(())
                 }
             }
             _ => Err(None.ok_or(format!(
-                "input ({:?}) not equal to parsed ({:?})",
-                s, deserialized
+                "input ({s:?}) not equal to parsed ({deserialized:?})"
             ))?),
         },
         serde_json::Value::Bool(b) => match deserialized {
             serde_json::Value::Bool(db) => {
                 if b != db {
-                    Err(None.ok_or(format!("input ({:?}) not equal to parsed ({:?})", b, db))?)
+                    Err(None.ok_or(format!("input ({b:?}) not equal to parsed ({db:?})"))?)
                 } else {
                     Ok(())
                 }
             }
             _ => Err(None.ok_or(format!(
-                "input ({:?}) not equal to parsed ({:?})",
-                b, deserialized
+                "input ({b:?}) not equal to parsed ({deserialized:?})"
             ))?),
         },
         serde_json::Value::Number(n) => match deserialized {
             serde_json::Value::Number(dn) => {
                 if n != dn {
-                    Err(None.ok_or(format!("input ({:?}) not equal to parsed ({:?})", n, dn))?)
+                    Err(None.ok_or(format!("input ({n:?}) not equal to parsed ({dn:?})"))?)
                 } else {
                     Ok(())
                 }
             }
             _ => Err(None.ok_or(format!(
-                "input ({:?}) not equal to parsed ({:?})",
-                n, deserialized
+                "input ({n:?}) not equal to parsed ({deserialized:?})"
             ))?),
         },
         serde_json::Value::Null => match deserialized {
             serde_json::Value::Null => Ok(()),
             _ => Err(None.ok_or(format!(
-                "input (Null) not equal to parsed ({:?})",
-                deserialized
+                "input (Null) not equal to parsed ({deserialized:?})"
             ))?),
         },
     }
@@ -117,17 +112,39 @@ fn validate_configuration(rqst: &AdmissionRequest) -> AdmissionResponse {
             let y = serde_json::to_string(&x).unwrap();
             let config: Configuration =
                 serde_json::from_str(y.as_str()).expect("Could not parse as Akri Configuration");
+            match validate_udev_discovery_details(&config) {
+                Ok(_) => {
+                    println!("validate_configuration - udev discovery details are valid");
+                }
+                Err(_) => {
+                    return AdmissionResponse {
+                        allowed: false,
+                        audit_annotations: None,
+                        patch: None,
+                        patch_type: None,
+                        status: Some(Status {
+                            api_version: None,
+                            code: None,
+                            details: None,
+                            kind: None,
+                            message: Some(
+                                "Invalid udev discovery details device permissions".to_owned(),
+                            ),
+                            metadata: None,
+                            reason: None,
+                            status: None,
+                        }),
+                        uid: rqst.uid.to_owned(),
+                        warnings: None,
+                    };
+                }
+            }
+
             let reserialized = serde_json::to_string(&config).unwrap();
             let deserialized: Value = serde_json::from_str(&reserialized).expect("untyped JSON");
-            println!(
-                "validate_configuration - deserialized Configuration: {:?}",
-                deserialized
-            );
+            println!("validate_configuration - deserialized Configuration: {deserialized:?}");
             let val: Value = filter_configuration(raw.clone());
-            println!(
-                "validate_configuration - expected deserialized format: {:?}",
-                val
-            );
+            println!("validate_configuration - expected deserialized format: {val:?}");
 
             // Do they match?
             match check(&val, &deserialized) {
@@ -170,6 +187,37 @@ fn validate_configuration(rqst: &AdmissionRequest) -> AdmissionResponse {
             uid: rqst.uid.to_owned(),
             warnings: None,
         },
+    }
+}
+
+fn validate_udev_discovery_details(config: &Configuration) -> Result<(), String> {
+    match &config.spec.discovery_handler.discovery_details {
+        details if details.is_empty() => {
+            println!("Discovery details are empty");
+            Ok(())
+        }
+        details => {
+            // Check if this is a Udev discovery handler
+            if config.spec.discovery_handler.name.to_lowercase() != "udev" {
+                // This is not a Udev configuration, so we don't need to validate it
+                return Ok(());
+            }
+
+            // Try to parse the discovery details as UdevDiscoveryDetails
+            match serde_yaml::from_str::<UdevDiscoveryDetails>(details) {
+                Ok(_) => {
+                    // The UdevDiscoveryDetails struct already has a custom deserializer for permissions
+                    // If we got here, that means the JSON was parsed successfully and permissions were validated
+                    Ok(())
+                }
+                Err(e) => {
+                    println!("Error parsing UdevDiscoveryDetails: {e}");
+                    println!("JSON was: {details}");
+                    // Return a proper error message when parsing fails
+                    Err(format!("Could not parse as Udev DiscoveryDetails: {e}"))
+                }
+            }
+        }
     }
 }
 
@@ -234,8 +282,8 @@ async fn main() -> std::io::Result<()> {
         .get_one::<u16>("port")
         .expect("valid port [0-65535]");
 
-    let endpoint = format!("0.0.0.0:{}", port);
-    println!("Started Webhook server: {}", endpoint);
+    let endpoint = format!("0.0.0.0:{port}");
+    println!("Started Webhook server: {endpoint}");
 
     let builder = get_builder(key_file, crt_file);
     HttpServer::new(|| App::new().service(validate))
@@ -489,9 +537,14 @@ mod tests {
 
     // Valid JSON but invalid akri.sh/v0/Configuration when inserted into
     // brokerSpec of ADMISSION_REVIEW OR EXTENDED_ADMISSION_REVIEW constants.
-    // Misplaced `resources`
-    //   Valid: .request.object.spec.brokerSpec.brokerPodSpec.containers[*].resources
-    // Invalid: .request.object.spec.brokerSpec.brokerPodSpec.resources
+    // Contains a field unknown to PodSpec — it gets dropped on typed
+    // deserialization, the round-trip mismatch is detected, and the
+    // Configuration is rejected.
+    //
+    // The previous fixture misplaced `resources` at the PodSpec level. Since
+    // k8s 1.32 added pod-level resources (PodLevelResources alpha), that
+    // pattern is no longer schema-invalid; a synthetic unknown field is used
+    // instead.
     const INVALID_BROKER_POD_SPEC: &str = r#"
     "brokerPodSpec": {
         "containers": [
@@ -500,11 +553,7 @@ mod tests {
                 "name": "name"
             }
         ],
-        "resources": {
-            "limits": {
-                "{{PLACEHOLDER}}": "1"
-            }
-        },
+        "xUnknownSyntheticField": "this_field_does_not_exist",
         "imagePullSecrets": [
             {
                 "name": "name"
@@ -538,9 +587,11 @@ mod tests {
 
     // Valid JSON but invalid akri.sh/v0/Configuration when inserted into
     // brokerSpec of ADMISSION_REVIEW OR EXTENDED_ADMISSION_REVIEW constants.
-    // Misplaced `resources`
-    //   Valid: .request.object.spec.brokerSpec.brokerJobSpec.template.spec.containers[*].resources
-    // Invalid: .request.object.spec.brokerSpec.brokerJobSpec.template.spec.resources
+    // Contains a field unknown to PodSpec inside the Job template — it gets
+    // dropped on typed deserialization, the round-trip mismatch is detected,
+    // and the Configuration is rejected. See INVALID_BROKER_POD_SPEC for the
+    // history (the prior fixture relied on pod-level `resources` being
+    // schema-invalid, which is no longer true as of k8s 1.32).
     const INVALID_BROKER_JOB_SPEC: &str = r#"
     "brokerJobSpec": {
         "template": {
@@ -556,11 +607,7 @@ mod tests {
                         }
                     }
                 ],
-                "resources": {
-                    "limits": {
-                        "{{PLACEHOLDER}}": "1"
-                    }
-                },
+                "xUnknownSyntheticField": "this_field_does_not_exist",
                 "imagePullSecrets": [
                     {
                         "name": "name"
@@ -610,7 +657,7 @@ mod tests {
 
     fn get_invalid_admission_review_with_broker_job_and_pod_spec() -> String {
         let invalid_setting_both_broker_job_and_pod =
-            format!("{},\n{}", VALID_BROKER_JOB_SPEC, VALID_BROKER_POD_SPEC);
+            format!("{VALID_BROKER_JOB_SPEC},\n{VALID_BROKER_POD_SPEC}");
         ADMISSION_REVIEW.replace(
             BROKER_SPEC_INSERTION_KEYWORD,
             &invalid_setting_both_broker_job_and_pod,
@@ -819,6 +866,29 @@ mod tests {
         assert!(resp.allowed);
     }
 
+    // Canary: the INVALID_BROKER_*_SPEC fixtures and the e2e
+    // test/e2e/yaml/webhookInvalidConfiguration.yaml rely on PodSpec silently
+    // dropping unknown fields on deserialization. If that contract changes
+    // (e.g. k8s-openapi starts using `deny_unknown_fields`, or upstream adds
+    // a field colliding with `xUnknownSyntheticField`), this test will fail
+    // loudly — and the fixture tests below would otherwise start passing for
+    // the wrong reason.
+    #[test]
+    fn test_pod_spec_drops_unknown_fields() {
+        use k8s_openapi::api::core::v1::PodSpec;
+        let raw = serde_json::json!({
+            "containers": [{"image": "x", "name": "x"}],
+            "xUnknownSyntheticField": "should-be-dropped"
+        });
+        let pod_spec: PodSpec = serde_json::from_value(raw).expect("PodSpec parses");
+        let round_tripped = serde_json::to_value(&pod_spec).expect("PodSpec serializes");
+        assert!(
+            round_tripped.get("xUnknownSyntheticField").is_none(),
+            "PodSpec deserialization should drop unknown fields; \
+             see INVALID_BROKER_POD_SPEC / INVALID_BROKER_JOB_SPEC fixtures"
+        );
+    }
+
     #[test]
     fn test_validate_configuration_invalid_podspec() {
         let invalid: AdmissionReview =
@@ -856,6 +926,15 @@ mod tests {
                 .expect("v1.AdmissionReview JSON");
         let rqst = valid.request.expect("v1.AdmissionRequest JSON");
         let resp = validate_configuration(&rqst);
+        assert!(resp.allowed);
+    }
+
+    #[test]
+    fn test_validate_udev_discovery_details() {
+        let discovery_properties = "";
+
+        // no discovery properties specified should success
+        let resp = run_validate_configuration_discovery_properties(discovery_properties);
         assert!(resp.allowed);
     }
 
@@ -1074,6 +1153,191 @@ mod tests {
         ],"#;
 
         run_validate_configuration_discovery_properties(discovery_properties);
+    }
+
+    // Tests for the validate_udev_discovery_details function
+    use akri_shared::akri::configuration::{ConfigurationSpec, DiscoveryHandlerInfo};
+
+    // Helper function to create a Configuration for testing validate_udev_discovery_details
+    fn create_test_config(discovery_details: &str) -> Configuration {
+        Configuration {
+            metadata: Default::default(),
+            spec: ConfigurationSpec {
+                discovery_handler: DiscoveryHandlerInfo {
+                    name: "udev".to_string(),
+                    discovery_details: discovery_details.to_string(),
+                    discovery_properties: None,
+                },
+                broker_spec: None,
+                instance_service_spec: None,
+                configuration_service_spec: None,
+                capacity: 1,
+                broker_properties: Default::default(),
+            },
+        }
+    }
+
+    #[test]
+    fn test_validate_udev_empty_discovery_details() {
+        let config = create_test_config("");
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_non_udev_json() {
+        // This JSON is valid but doesn't match the UdevDiscoveryDetails structure
+        let config = create_test_config(r#"{"something":"else"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_invalid_json() {
+        // Malformed JSON
+        let config = create_test_config(r#"{"rules": ["missing closing bracket"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_r() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "r"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_w() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "w"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_m() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "m"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_rw() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "rw"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_rm() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "rm"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_wm() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "wm"}"#);
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_valid_permission_rwm() {
+        let config = create_test_config(
+            r#"{"groupRecursive": false, "udevRules": ["KERNEL=='video[0-9]*'"], "permissions": "rwm"}"#,
+        );
+        assert!(validate_udev_discovery_details(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_udev_missing_permissions() {
+        // UdevDiscoveryDetails with no permissions field should use default permissions
+        let config = create_test_config(r#"{"udevRules": []}"#);
+        let result = validate_udev_discovery_details(&config);
+        // This may now return an error if permissions is a required field in UdevDiscoveryDetails
+        if let Err(e) = result {
+            assert!(
+                e.to_string()
+                    .contains("Could not parse as Udev DiscoveryDetails")
+            );
+        } else {
+            // If it parsed successfully, then UdevDiscoveryDetails must have a default for permissions
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_udev_empty_object() {
+        // Empty JSON object might now fail if required fields are missing
+        let config = create_test_config("{}");
+        let result = validate_udev_discovery_details(&config);
+        if let Err(e) = result {
+            assert!(
+                e.to_string()
+                    .contains("Could not parse as Udev DiscoveryDetails")
+            );
+        } else {
+            // If it parsed successfully, then UdevDiscoveryDetails must have defaults for all fields
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn test_validate_udev_invalid_permission_rwx() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": "rwx"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_invalid_permission_empty() {
+        let config = create_test_config(r#"{"udevRules": [], "permissions": ""}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_invalid_permission_x() {
+        let config = create_test_config(r#"{"udev_rules": [], "permissions": "x"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Could not parse as Udev DiscoveryDetails")
+        );
+    }
+
+    #[test]
+    fn test_validate_udev_error_message_format() {
+        // Test with a completely invalid JSON to verify error formatting
+        let config = create_test_config(r#"{"this is not valid json"}"#);
+        let result = validate_udev_discovery_details(&config);
+        assert!(result.is_err());
+        let error_message = result.unwrap_err().to_string();
+        assert_eq!(
+            error_message,
+            "Could not parse as Udev DiscoveryDetails: missing field `udevRules`"
+        );
     }
 
     fn run_validate_configuration_discovery_properties(

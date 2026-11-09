@@ -1,6 +1,6 @@
 use super::{
-    super::akri::API_NAMESPACE, OwnershipInfo, ERROR_CONFLICT, ERROR_NOT_FOUND,
-    NODE_SELECTOR_OP_IN, OBJECT_NAME_FIELD, RESOURCE_REQUIREMENTS_KEY,
+    super::akri::API_NAMESPACE, ERROR_CONFLICT, ERROR_NOT_FOUND, NODE_SELECTOR_OP_IN,
+    OBJECT_NAME_FIELD, OwnershipInfo, RESOURCE_REQUIREMENTS_KEY,
 };
 use either::Either;
 use k8s_openapi::api::core::v1::{
@@ -62,8 +62,7 @@ pub async fn find_pods_with_selector(
 ) -> Result<ObjectList<Pod>, anyhow::Error> {
     trace!(
         "find_pods_with_selector with label_selector={:?} field_selector={:?}",
-        &label_selector,
-        &field_selector
+        &label_selector, &field_selector
     );
     let pods: Api<Pod> = Api::all(kube_client);
     let pod_list_params = ListParams {
@@ -102,13 +101,13 @@ pub fn create_broker_app_name(
         // node-specific content.  To ensure uniqueness of the Pod/Job we are creating,
         // prepend the node name here.
         match node_to_run_broker_on {
-            Some(n) => format!("{}-{}-{}", n, normalized_instance_name, app_name_suffix),
-            None => format!("{}-{}", normalized_instance_name, app_name_suffix),
+            Some(n) => format!("{n}-{normalized_instance_name}-{app_name_suffix}"),
+            None => format!("{normalized_instance_name}-{app_name_suffix}"),
         }
     } else {
         // If the device capability is NOT shared, the instance name will contain
-        // node-specific content, which guarntees uniqueness.
-        format!("{}-{}", normalized_instance_name, app_name_suffix)
+        // node-specific content, which guarantees uniqueness.
+        format!("{normalized_instance_name}-{app_name_suffix}")
     }
 }
 
@@ -252,6 +251,7 @@ pub fn modify_pod_spec(
                         None => None,
                     }
                 },
+                claims: None,
             });
         };
     }
@@ -456,6 +456,7 @@ mod broker_podspec_tests {
                 resources: Some(ResourceRequirements {
                     limits: Some(placeholder_limits),
                     requests: Some(placeholder_requests),
+                    claims: None,
                 }),
                 ..Default::default()
             }],
@@ -481,6 +482,7 @@ mod broker_podspec_tests {
                     resources: Some(ResourceRequirements {
                         limits: Some(placeholder_limits1),
                         requests: Some(placeholder_requests1),
+                        claims: None,
                     }),
                     ..Default::default()
                 },
@@ -489,6 +491,7 @@ mod broker_podspec_tests {
                     resources: Some(ResourceRequirements {
                         limits: Some(placeholder_limits2),
                         requests: Some(placeholder_requests2),
+                        claims: None,
                     }),
                     ..Default::default()
                 },
@@ -514,6 +517,7 @@ mod broker_podspec_tests {
                     resources: Some(ResourceRequirements {
                         limits: Some(placeholder_limits.clone()),
                         requests: Some(placeholder_limits.clone()),
+                        claims: None,
                     }),
                     ..Default::default()
                 },
@@ -522,6 +526,7 @@ mod broker_podspec_tests {
                     resources: Some(ResourceRequirements {
                         limits: Some(placeholder_limits.clone()),
                         requests: Some(placeholder_limits.clone()),
+                        claims: None,
                     }),
                     ..Default::default()
                 },
@@ -531,6 +536,7 @@ mod broker_podspec_tests {
                 resources: Some(ResourceRequirements {
                     limits: Some(placeholder_limits.clone()),
                     requests: Some(placeholder_limits.clone()),
+                    claims: None,
                 }),
                 ..Default::default()
             }]),
@@ -685,7 +691,7 @@ mod broker_podspec_tests {
                     .kind
             );
             assert_eq!(
-                &format!("{}/{}", API_NAMESPACE, API_VERSION),
+                &format!("{API_NAMESPACE}/{API_VERSION}"),
                 &pod.metadata
                     .clone()
                     .owner_references
@@ -694,24 +700,26 @@ mod broker_podspec_tests {
                     .unwrap()
                     .api_version
             );
-            assert!(pod
-                .metadata
-                .clone()
-                .owner_references
-                .unwrap()
-                .first()
-                .unwrap()
-                .controller
-                .unwrap());
-            assert!(pod
-                .metadata
-                .clone()
-                .owner_references
-                .unwrap()
-                .first()
-                .unwrap()
-                .block_owner_deletion
-                .unwrap());
+            assert!(
+                pod.metadata
+                    .clone()
+                    .owner_references
+                    .unwrap()
+                    .first()
+                    .unwrap()
+                    .controller
+                    .unwrap()
+            );
+            assert!(
+                pod.metadata
+                    .clone()
+                    .owner_references
+                    .unwrap()
+                    .first()
+                    .unwrap()
+                    .block_owner_deletion
+                    .unwrap()
+            );
 
             // Validate existing and new affinity exist
             assert_eq!(
@@ -863,7 +871,7 @@ mod broker_podspec_tests {
                     .unwrap()
             );
 
-            // Validate image name remanes unchanged
+            // Validate image name remains unchanged
             for i in 0..num_containers {
                 assert_eq!(
                     &image_names.get(i).unwrap(),

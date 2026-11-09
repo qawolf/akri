@@ -10,7 +10,7 @@ check_file_version()
     
     CORRECT_VERSION=$(cat $FILE | grep "$LINE_PATTERN" | grep "$VERSION_STRING")
     if [ "$CORRECT_VERSION" == "" ]; then
-    echo "    Needs upate: $FILE"
+    echo "    Needs update: $FILE"
     echo "        To ensure all files match version.txt, run: version.sh -u -s"
     return 1
     else
@@ -29,7 +29,7 @@ check_twoline_version()
     
     CORRECT_VERSION=$(grep "$LINE1_PATTERN" -A 1 $FILE | grep "$VERSION_STRING")
     if [ "$CORRECT_VERSION" == "" ]; then
-    echo "    Needs upate: $FILE"
+    echo "    Needs update: $FILE"
     echo "        To ensure all files match version.txt, run: version.sh -u -s"
     return 1
     else
@@ -129,7 +129,7 @@ if [ "$CHECK" == "1" ]; then
     check_file_version "$BASEDIR/Cargo.toml" "$TOML_VERSION_PATTERN" "$TOML_VERSION"
     if [ "$?" -eq "1" ]; then exit 1; fi
 
-    CARGO_LOCK_PROJECTS="controller akri-shared agent controller webhook-configuration udev-video-broker akri-discovery-utils akri-debug-echo akri-udev akri-onvif akri-opcua debug-echo-discovery-handler onvif-discovery-handler udev-discovery-handler opcua-discovery-handler"
+    CARGO_LOCK_PROJECTS="controller akri-shared agent controller webhook-configuration akri-discovery-utils akri-debug-echo akri-udev akri-onvif akri-opcua debug-echo-discovery-handler onvif-discovery-handler udev-discovery-handler opcua-discovery-handler"
     CARGO_LOCK_VERSION="\"$(echo $VERSION)\""
     for CARGO_LOCK_PROJECT in $CARGO_LOCK_PROJECTS
     do

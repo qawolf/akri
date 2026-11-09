@@ -15,15 +15,16 @@ use futures::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::discovery_handler_manager::{
-    discovery_handler_registry::DiscoveryHandlerRegistry, DiscoveryError,
+    DiscoveryError, discovery_handler_registry::DiscoveryHandlerRegistry,
 };
 
-use kube::{Resource, ResourceExt};
-use kube_runtime::{
+use kube::api::ObjectMeta;
+use kube::runtime::{
+    Controller,
     controller::Action,
     reflector::{ObjectRef, Store},
-    Controller,
 };
+use kube::{Resource, ResourceExt};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -203,7 +204,16 @@ async fn delete_instance(
                 .map_err(|e| Error::Other(e.into()))?;
             return Ok(());
         }
-        let mut new_instance = instance.clone();
+        // Apply a clean copy of the instance, cleaning the nodes
+        // and keeping the necessary metadata fields.
+        let mut new_instance = Instance {
+            metadata: ObjectMeta {
+                name: instance.metadata.name.clone(),
+                namespace: instance.metadata.namespace.clone(),
+                ..Default::default()
+            },
+            spec: instance.spec.clone(),
+        };
         new_instance.spec.nodes = vec![];
         api.apply(new_instance, agent_instance_name)
             .await
@@ -305,7 +315,7 @@ mod tests {
             },
         });
 
-        let (store, _) = kube_runtime::reflector::store();
+        let (store, _) = kube::runtime::reflector::store();
 
         let ctx = Arc::new(ControllerContext {
             instances_cache: store,
@@ -468,7 +478,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_nothing_to_do() {
-        let (store, _) = kube_runtime::reflector::store();
+        let (store, _) = kube::runtime::reflector::store();
         let mut client = MockDiscoveryConfigurationKubeClient::default();
         let api = MockApi::new();
         client
@@ -521,81 +531,81 @@ mod tests {
 
     #[tokio::test]
     async fn test_reconcile_no_request_existing_instances() {
-        let (store, mut writer) = kube_runtime::reflector::store();
-        writer.apply_watcher_event(&kube_runtime::watcher::Event::Restarted(vec![
-            Instance {
-                metadata: ObjectMeta {
-                    namespace: Some("namespace-a".to_string()),
-                    name: Some("instance-1".to_string()),
-                    owner_references: Some(vec![OwnerReference {
-                        api_version: Instance::api_version(&()).to_string(),
-                        block_owner_deletion: None,
-                        controller: Some(true),
-                        kind: "Configuration".to_string(),
-                        name: "config-1".to_string(),
-                        uid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
-                    }]),
-                    ..Default::default()
-                },
-                spec: InstanceSpec {
-                    configuration_name: "config-1".to_string(),
-                    cdi_name: "akri.sh/config-1=abcdef".to_string(),
-                    capacity: 1,
-                    broker_properties: HashMap::new(),
-                    shared: true,
-                    nodes: vec!["node-a".to_string()],
-                    device_usage: Default::default(),
-                },
+        let (store, mut writer) = kube::runtime::reflector::store();
+        writer.apply_watcher_event(&kube::runtime::watcher::Event::Init);
+        writer.apply_watcher_event(&kube::runtime::watcher::Event::InitApply(Instance {
+            metadata: ObjectMeta {
+                namespace: Some("namespace-a".to_string()),
+                name: Some("instance-1".to_string()),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: Instance::api_version(&()).to_string(),
+                    block_owner_deletion: None,
+                    controller: Some(true),
+                    kind: "Configuration".to_string(),
+                    name: "config-1".to_string(),
+                    uid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+                }]),
+                ..Default::default()
             },
-            Instance {
-                metadata: ObjectMeta {
-                    namespace: Some("namespace-a".to_string()),
-                    name: Some("instance-2".to_string()),
-                    owner_references: Some(vec![OwnerReference {
-                        api_version: Instance::api_version(&()).to_string(),
-                        block_owner_deletion: None,
-                        controller: Some(true),
-                        kind: "Configuration".to_string(),
-                        name: "config-1".to_string(),
-                        uid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
-                    }]),
-                    ..Default::default()
-                },
-                spec: InstanceSpec {
-                    configuration_name: "config-1".to_string(),
-                    cdi_name: "akri.sh/config-1=abcdef".to_string(),
-                    capacity: 1,
-                    broker_properties: HashMap::new(),
-                    shared: true,
-                    nodes: vec!["node-b".to_string()],
-                    device_usage: Default::default(),
-                },
+            spec: InstanceSpec {
+                configuration_name: "config-1".to_string(),
+                cdi_name: "akri.sh/config-1=abcdef".to_string(),
+                capacity: 1,
+                broker_properties: HashMap::new(),
+                shared: true,
+                nodes: vec!["node-a".to_string()],
+                device_usage: Default::default(),
             },
-            Instance {
-                metadata: ObjectMeta {
-                    namespace: Some("namespace-a".to_string()),
-                    name: Some("instance-3".to_string()),
-                    owner_references: Some(vec![OwnerReference {
-                        api_version: Instance::api_version(&()).to_string(),
-                        block_owner_deletion: None,
-                        controller: Some(true),
-                        kind: "Configuration".to_string(),
-                        name: "config-2".to_string(),
-                        uid: "11112233-4455-6677-8899-aabbccddeeff".to_string(),
-                    }]),
-                    ..Default::default()
-                },
-                spec: InstanceSpec {
-                    configuration_name: "config-2".to_string(),
-                    cdi_name: "akri.sh/config-2=abcdef".to_string(),
-                    capacity: 1,
-                    broker_properties: HashMap::new(),
-                    shared: true,
-                    nodes: vec!["node-a".to_string()],
-                    device_usage: Default::default(),
-                },
+        }));
+        writer.apply_watcher_event(&kube::runtime::watcher::Event::InitApply(Instance {
+            metadata: ObjectMeta {
+                namespace: Some("namespace-a".to_string()),
+                name: Some("instance-2".to_string()),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: Instance::api_version(&()).to_string(),
+                    block_owner_deletion: None,
+                    controller: Some(true),
+                    kind: "Configuration".to_string(),
+                    name: "config-1".to_string(),
+                    uid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+                }]),
+                ..Default::default()
             },
-        ]));
+            spec: InstanceSpec {
+                configuration_name: "config-1".to_string(),
+                cdi_name: "akri.sh/config-1=abcdef".to_string(),
+                capacity: 1,
+                broker_properties: HashMap::new(),
+                shared: true,
+                nodes: vec!["node-b".to_string()],
+                device_usage: Default::default(),
+            },
+        }));
+        writer.apply_watcher_event(&kube::runtime::watcher::Event::InitApply(Instance {
+            metadata: ObjectMeta {
+                namespace: Some("namespace-a".to_string()),
+                name: Some("instance-3".to_string()),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: Instance::api_version(&()).to_string(),
+                    block_owner_deletion: None,
+                    controller: Some(true),
+                    kind: "Configuration".to_string(),
+                    name: "config-2".to_string(),
+                    uid: "11112233-4455-6677-8899-aabbccddeeff".to_string(),
+                }]),
+                ..Default::default()
+            },
+            spec: InstanceSpec {
+                configuration_name: "config-2".to_string(),
+                cdi_name: "akri.sh/config-2=abcdef".to_string(),
+                capacity: 1,
+                broker_properties: HashMap::new(),
+                shared: true,
+                nodes: vec!["node-a".to_string()],
+                device_usage: Default::default(),
+            },
+        }));
+        writer.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
         let mut client = MockDiscoveryConfigurationKubeClient::default();
         let mut api = MockApi::new();
         api.expect_add_finalizer().returning(|_, _| Ok(()));
