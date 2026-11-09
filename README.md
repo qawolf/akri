@@ -1,3 +1,29 @@
+## QA Wolf fork
+
+This is QA Wolf's fork of [project-akri/akri](https://github.com/project-akri/akri). The upstream README starts
+below this section.
+
+- The default branch `qawolf-main` is an upstream release tag plus our commits. Today the base is `v0.13.8`.
+- Our commits (code): none yet.
+- Our commits (repo): the upstream workflows are deleted. `.github/workflows/qawolf-ci.yml` runs `cargo build` and
+  `cargo test` on every PR and on every push to `qawolf-main`.
+- `main` and the upstream tags stay as upstream has them.
+- Images: QA Wolf's wolf-ops repo builds `controller`, `agent` and `udev-discovery` (linux/amd64) from a pinned
+  commit of this fork. Its `apps/akri/README.md` has the build and deploy steps.
+
+### QA Wolf releases
+
+1. Open a PR into `qawolf-main`. The `Compile and test` check must pass. Merge it.
+2. Tag the merge commit `vX.Y.Z-qawolf.N`. `X.Y.Z` is the upstream base. `N` counts our releases on that base,
+   from 1. `version.txt`, `Cargo.toml` and the Helm chart keep the upstream number.
+3. In wolf-ops, set `AKRI_COMMIT` (the tagged commit) and `VERSION` (the tag) in `apps/akri/Dockerfile`. Its merge
+   builds the images.
+
+To move to a new upstream tag, open a PR that merges the tag into `qawolf-main` (no force push on `qawolf-main`).
+Then start `N` at 1.
+
+---
+
 <p align="center"><img src="https://github.com/project-akri/akri-docs/blob/main/art/logo-horizontal/akri-logo-horizontal-light.svg" alt="Akri Logo" width="300"></p>
 
 [![Slack channel #akri](https://img.shields.io/badge/slack-akri-blueviolet.svg?logo=slack)](https://kubernetes.slack.com/messages/akri)
