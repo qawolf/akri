@@ -3,8 +3,9 @@
 This is QA Wolf's fork of [project-akri/akri](https://github.com/project-akri/akri). The upstream README starts
 below this section.
 
-- The default branch `qawolf-main` is an upstream release tag plus our commits. Today the base is `v0.13.8`.
-- Our commits (code): none yet.
+- The default branch `qawolf-main` is an upstream release tag plus our commits. Today the base is `v0.14.0`.
+- Our commits (code): the patched `h2` that upstream pins as a git patch is copied into `third-party/h2` and used
+  as a Cargo path patch. `third-party/README.md` tells why and how to check the copy.
 - Our commits (repo): the upstream workflows are deleted. `.github/workflows/qawolf-ci.yml` runs `cargo build` and
   `cargo test` on every PR and on every push to `qawolf-main`.
 - `main` and the upstream tags stay as upstream has them.
@@ -20,6 +21,8 @@ below this section.
    builds the images.
 
 To move to a new upstream tag, open a PR that merges the tag into `qawolf-main` (no force push on `qawolf-main`).
+Merge it with a merge commit, not a squash, so that the next upstream merge has a merge base. Delete the upstream
+workflows that the merge brings back, and set `RUST_TOOLCHAIN` in `qawolf-ci.yml` to the upstream Rust version.
 Then start `N` at 1.
 
 ---
