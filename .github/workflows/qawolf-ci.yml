@@ -1,0 +1,47 @@
+# QA Wolf fork CI: compile the workspace and run the basic tests.
+# The upstream workflows are deleted on qawolf-main. wolf-ops builds the images.
+name: Compile and test
+
+on:
+  pull_request:
+  push:
+    branches: [qawolf-main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The rust image that wolf-ops' Dockerfile builds with.
+  RUST_TOOLCHAIN: 1.79.0
+
+jobs:
+  build-and-test:
+    name: Compile and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Install Linux packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev libudev-dev libv4l-dev pkg-config protobuf-compiler
+
+      - name: cargo build
+        run: cargo build --locked
+
+      - name: cargo test
+        run: cargo test --locked
