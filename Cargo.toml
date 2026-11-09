@@ -1,11 +1,13 @@
 [patch.crates-io]
 # Patch is still needed, using one from upstream PR for now, hosted on a fork of ours to help
 # with supply chain integrity.
-# rev below is the tip of the `patch-authority` branch, pinned by commit so a future
-# `cargo update` can't silently move the patch (which is how it previously went stale).
-h2 = { git = 'https://github.com/project-akri/h2', rev = 'e01e8842a37bc3590228e9ab408fc1710018c031'}
+# QA Wolf: a copy of project-akri/h2 at e01e8842a37bc3590228e9ab408fc1710018c031 (branch
+# `patch-authority`), without fixtures/, ci/ and .github/. See third-party/README.md.
+h2 = { path = 'third-party/h2' }
 
 [workspace]
+# The h2 copy is a patch, not a workspace member.
+exclude = ["third-party/h2"]
 members = [
     "shared", 
     "agent", 
