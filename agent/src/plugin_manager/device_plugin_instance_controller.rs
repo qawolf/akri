@@ -794,8 +794,9 @@ impl DevicePluginManager {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, u)| match u {
+                        // The kubelet device id, as advertised in list_and_watch
                         DeviceUsage::Node(n) if *n == self.node_name => {
-                            Some(format!("{DP_SLOT_PREFIX}{instance}-{i}"))
+                            Some(format!("{instance}-{i}"))
                         }
                         DeviceUsage::Configuration { vdev, node } if *node == self.node_name => {
                             Some(vdev.to_string())
@@ -1179,10 +1180,77 @@ mod tests {
             .insert("instance-a".to_owned(), instance_plugin);
         assert_eq!(
             dpm.get_used_slots().await,
-            HashSet::from([
-                "akri.sh/config-a-1".to_owned(),
-                "akri.sh/instance-a-1".to_owned()
-            ])
+            HashSet::from(["akri.sh/config-a-1".to_owned(), "instance-a-1".to_owned()])
+        );
+    }
+
+    // The reclaimer compares these ids with the kubelet's ids and frees the rest with free_slot.
+    #[tokio::test]
+    async fn test_free_slot_with_kubelet_id() {
+        let dm = crate::device_manager::MockDeviceManager::new();
+        let mut kube_client = MockIntoApi::new();
+        kube_client.expect_namespaced().returning(|_| {
+            let mut api = MockApi::new();
+            api.expect_raw_patch()
+                .with(
+                    mockall::predicate::eq("instance-a"),
+                    mockall::predicate::function(|a: &Patch<serde_json::Value>| match a {
+                        Patch::Apply(v) => {
+                            let su: Object<PartialInstanceSlotUsage, NotUsed> =
+                                serde_json::from_value(v.clone()).unwrap();
+                            su.spec.device_usage.is_empty()
+                        }
+                        _ => false,
+                    }),
+                    mockall::predicate::always(),
+                )
+                .times(1)
+                .returning(|_, _, _| {
+                    Ok(Instance {
+                        metadata: Default::default(),
+                        spec: InstanceSpec {
+                            configuration_name: "config-a".to_owned(),
+                            cdi_name: Default::default(),
+                            capacity: 1,
+                            broker_properties: Default::default(),
+                            shared: false,
+                            nodes: Default::default(),
+                            device_usage: Default::default(),
+                        },
+                    })
+                });
+            Box::new(api)
+        });
+        let kube_client = Arc::new(kube_client);
+        let dpm = DevicePluginManager::new("node-a".to_owned(), kube_client.clone(), Arc::new(dm));
+        let (s, _) = watch::channel(vec![DeviceUsage::Node("node-a".to_owned())]);
+        let instance_plugin = Arc::new(InstanceDevicePlugin {
+            device: Device {
+                name: "my-device".to_owned(),
+                annotations: Default::default(),
+                container_edits: Default::default(),
+            },
+            slots_status: Mutex::new(s),
+            node_name: "node-a".to_owned(),
+            instance_name: "instance-a".to_owned(),
+            instance_namespace: "namespace-a".to_owned(),
+            kube_client,
+            stopper: Stopper::new(),
+        });
+        dpm.instance_plugins
+            .lock()
+            .await
+            .insert("instance-a".to_owned(), instance_plugin.clone());
+
+        // Same id as the kubelet's pod-resources List: no "akri.sh/" prefix.
+        let used = dpm.get_used_slots().await;
+        assert_eq!(used, HashSet::from(["instance-a-0".to_owned()]));
+        for slot in used {
+            assert!(dpm.free_slot(slot).await.is_ok());
+        }
+        assert_eq!(
+            instance_plugin.slots_status.lock().await.borrow()[0],
+            DeviceUsage::Unused
         );
     }
 
