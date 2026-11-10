@@ -138,6 +138,9 @@ pub trait DiscoveryHandlerEndpoint: Send + Sync {
 pub trait DiscoveryHandlerRequest: Sync + Send {
     async fn get_instances(&self) -> Result<Vec<Instance>, DiscoveryError>;
     async fn set_extra_device_properties(&self, extra_device_properties: HashMap<String, String>);
+    /// True when every discovery handler endpoint of this request has sent at least one device list.
+    /// Before that, a device missing from [get_instances](Self::get_instances) may only be not reported yet.
+    async fn all_endpoints_answered(&self) -> bool;
 }
 
 /// This trait is here to help with testing for code that interact with the discovery handler registry
@@ -168,9 +171,26 @@ pub trait DiscoveryHandlerRegistry: Sync + Send {
     async fn register_endpoint(&self, endpoint: Arc<dyn DiscoveryHandlerEndpoint>);
 }
 
+/// The device list of one discovery handler endpoint for a request.
+#[derive(Clone)]
+struct EndpointStream {
+    devices: watch::Receiver<Vec<Arc<DiscoveredDevice>>>,
+    /// The endpoint has sent at least one device list.
+    answered: bool,
+}
+
+impl From<watch::Receiver<Vec<Arc<DiscoveredDevice>>>> for EndpointStream {
+    fn from(devices: watch::Receiver<Vec<Arc<DiscoveredDevice>>>) -> Self {
+        Self {
+            devices,
+            answered: false,
+        }
+    }
+}
+
 /// Real world implementation of the Discovery Handler Request
 struct DHRequestImpl {
-    endpoints: RwLock<Vec<watch::Receiver<Vec<Arc<DiscoveredDevice>>>>>,
+    endpoints: RwLock<Vec<EndpointStream>>,
     notifier: watch::Sender<crate::device_manager::cdi::Kind>,
     key: String,
     handler_name: String,
@@ -190,9 +210,14 @@ impl DiscoveryHandlerRequest for DHRequestImpl {
             .read()
             .await
             .iter()
-            .flat_map(|r| r.borrow().clone().into_iter())
+            .flat_map(|r| r.devices.borrow().clone().into_iter())
             .map(|i| self.device_to_instance(i.as_ref(), &properties))
             .collect())
+    }
+
+    async fn all_endpoints_answered(&self) -> bool {
+        let endpoints = self.endpoints.read().await;
+        !endpoints.is_empty() && endpoints.iter().all(|e| e.answered)
     }
 
     async fn set_extra_device_properties(&self, extra_device_properties: HashMap<String, String>) {
@@ -252,15 +277,19 @@ impl DHRequestImpl {
     ) {
         loop {
             let mut local_endpoints = self.endpoints.write().await.clone();
-            let futures = local_endpoints.iter_mut().map(|e| e.changed().boxed());
+            let futures = local_endpoints
+                .iter_mut()
+                .map(|e| e.devices.changed().boxed());
             select! {
                 (a, index, _) = select_all(futures) => {
+                    let mut write_endpoint = self.endpoints.write().await;
                     if a.is_err() {
-                        let mut write_endpoint = self.endpoints.write().await;
                         write_endpoint.remove(index);
                         if write_endpoint.is_empty() {
                             return;
                         }
+                    } else {
+                        write_endpoint[index].answered = true;
                     }
                 },
                 Ok(new_dh_endpoint) = new_dh_receiver.recv() => {
@@ -269,7 +298,7 @@ impl DHRequestImpl {
                         continue
                     }
                     if let Ok(q) = self.query(new_dh_endpoint).await {
-                        self.endpoints.write().await.push(q);
+                        self.endpoints.write().await.push(q.into());
                     }
                 },
                 _ = self.notifier.closed() => {
@@ -281,7 +310,7 @@ impl DHRequestImpl {
                 .write()
                 .await
                 .iter_mut()
-                .flat_map(|r| r.borrow_and_update().clone().into_iter())
+                .flat_map(|r| r.devices.borrow_and_update().clone().into_iter())
                 .unique_by(|d| self.get_device_cdi_fqdn(d))
                 .collect();
             self.notifier
@@ -435,7 +464,7 @@ impl DiscoveryHandlerRegistry for DHRegistryImpl {
                     .map(|handler| dh_req.query(handler.clone()));
                 let dh_streams: Vec<watch::Receiver<Vec<Arc<DiscoveredDevice>>>> =
                     try_join_all(dh_futures).await?;
-                dh_req.endpoints = RwLock::new(dh_streams);
+                dh_req.endpoints = RwLock::new(dh_streams.into_iter().map(Into::into).collect());
                 {
                     let mut req_w = self.requests.write().await;
                     req_w.insert(key.to_string(), Arc::new(dh_req));
@@ -644,7 +673,7 @@ mod tests {
             },
             "my_node".to_owned(),
         ))]);
-        let endpoints = RwLock::new(vec![notifier]);
+        let endpoints = RwLock::new(vec![notifier.into()]);
         let (cdi_notifier, _) = watch::channel(Default::default());
         let req = DHRequestImpl {
             endpoints,
@@ -685,11 +714,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_dh_request_impl_all_endpoints_answered() {
+        let (notifier, _n_rec) = watch::channel(Default::default());
+        let (dh_send_1, dh_rec_1) = watch::channel(Default::default());
+        let (dh_send_2, dh_rec_2) = watch::channel(Default::default());
+        let req = Arc::new(DHRequestImpl {
+            endpoints: RwLock::new(vec![dh_rec_1.into(), dh_rec_2.into()]),
+            notifier,
+            key: "my_config".to_owned(),
+            handler_name: "mock_handler".to_string(),
+            details: Default::default(),
+            properties: Default::default(),
+            extra_device_properties: Default::default(),
+            kube_client: Arc::new(MockDiscoveryManagerKubeInterface::new()),
+            termination_notifier: Arc::new(Notify::new()),
+        });
+        let req_ref = req.clone();
+        let (_new_dh_sen, rec) = broadcast::channel(1);
+        let task = tokio::spawn(async move { req_ref.watch_devices(rec).await });
+
+        assert!(!req.all_endpoints_answered().await);
+        // An empty device list is an answer too.
+        dh_send_1.send(vec![]).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!req.all_endpoints_answered().await);
+        dh_send_2.send(vec![]).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(req.all_endpoints_answered().await);
+        task.abort();
+    }
+
+    #[tokio::test]
     async fn test_dh_request_impl_watch_devices() {
         let (notifier, mut n_rec) = watch::channel(Default::default());
         let (dh_send, dh_rec) = watch::channel(Default::default());
         let req = Arc::new(DHRequestImpl {
-            endpoints: RwLock::new(vec![dh_rec]),
+            endpoints: RwLock::new(vec![dh_rec.into()]),
             notifier,
             key: "my_config".to_owned(),
             handler_name: "mock_handler".to_string(),

@@ -76,7 +76,8 @@ pub async fn start_controller(
 ///  - Add finalizer if not here already
 ///  - Start discovery if not already started
 ///  - Get discovery results (empty list if just started)
-///  - Create/Delete Instances according to discovery results
+///  - Create Instances according to discovery results
+///  - Delete Instances that are not in the discovery results, only once every discovery handler answered
 pub async fn reconcile(
     dc: Arc<Configuration>,
     ctx: Arc<ControllerContext>,
@@ -114,12 +115,15 @@ pub async fn reconcile(
         .unwrap_or_default();
     let dh_extra_device_properties = dc.spec.broker_properties.clone();
 
-    let discovered_instances: Vec<Instance> =
+    let (discovered_instances, discovery_answered): (Vec<Instance>, bool) =
         match ctx.dh_registry.get_request(&dc.name_any()).await {
             Some(req) => {
                 req.set_extra_device_properties(dc.spec.broker_properties.clone())
                     .await;
-                req.get_instances()
+                // Read this before the Instances: an answer that arrives in between only adds devices.
+                let answered = req.all_endpoints_answered().await;
+                let instances = req
+                    .get_instances()
                     .await?
                     .into_iter()
                     .map(|mut instance| {
@@ -129,7 +133,8 @@ pub async fn reconcile(
                         instance.spec.capacity = dc.spec.capacity;
                         instance
                     })
-                    .collect()
+                    .collect();
+                (instances, answered)
             }
             None => {
                 ctx.dh_registry
@@ -142,23 +147,33 @@ pub async fn reconcile(
                         &dc.namespace().unwrap_or("default".to_string()),
                     )
                     .await?;
-                vec![]
+                (vec![], false)
             }
         };
 
-    for instance in ctx.instances_cache.state() {
-        if instance.owner_references().contains(&owner_ref)
-            && !discovered_instances
-                .iter()
-                .any(|di| di.name_any() == instance.name_any())
-        {
-            delete_instance(
-                ctx.client.as_ref(),
-                instance.as_ref(),
-                &ctx.agent_identifier,
-            )
-            .await?
+    // A new request (agent or discovery handler restart) has no device list yet. Deleting now would
+    // delete every Instance of this node and recycle its workloads (upstream #853).
+    if discovery_answered {
+        for instance in ctx.instances_cache.state() {
+            if instance.owner_references().contains(&owner_ref)
+                && !discovered_instances
+                    .iter()
+                    .any(|di| di.name_any() == instance.name_any())
+            {
+                delete_instance(
+                    ctx.client.as_ref(),
+                    instance.as_ref(),
+                    &ctx.agent_identifier,
+                )
+                .await?
+            }
         }
+    } else {
+        info!(
+            "Configuration {}::{}: keep existing Instances until every discovery handler answered",
+            namespace,
+            dc.name_any()
+        );
     }
 
     for instance in discovered_instances {
@@ -491,6 +506,7 @@ mod tests {
         request
             .expect_set_extra_device_properties()
             .returning(|_| {});
+        request.expect_all_endpoints_answered().returning(|| true);
         request.expect_get_instances().returning(|| Ok(vec![]));
         registry
             .expect_get_request()
@@ -529,121 +545,62 @@ mod tests {
         assert!(reconcile(dc, ctx).await.is_ok());
     }
 
-    #[tokio::test]
-    async fn test_reconcile_no_request_existing_instances() {
+    fn test_instance(name: &str, config: &str, config_uid: &str, node: &str) -> Instance {
+        Instance {
+            metadata: ObjectMeta {
+                namespace: Some("namespace-a".to_string()),
+                name: Some(name.to_string()),
+                owner_references: Some(vec![OwnerReference {
+                    api_version: Instance::api_version(&()).to_string(),
+                    block_owner_deletion: None,
+                    controller: Some(true),
+                    kind: "Configuration".to_string(),
+                    name: config.to_string(),
+                    uid: config_uid.to_string(),
+                }]),
+                ..Default::default()
+            },
+            spec: InstanceSpec {
+                configuration_name: config.to_string(),
+                cdi_name: format!("akri.sh/{config}=abcdef"),
+                capacity: 1,
+                broker_properties: HashMap::new(),
+                shared: true,
+                nodes: vec![node.to_string()],
+                device_usage: Default::default(),
+            },
+        }
+    }
+
+    /// instance-1: config-1 on node-a, instance-2: config-1 on node-b, instance-3: config-2 on node-a.
+    fn test_instances_cache() -> Store<Instance> {
         let (store, mut writer) = kube::runtime::reflector::store();
         writer.apply_watcher_event(&kube::runtime::watcher::Event::Init);
-        writer.apply_watcher_event(&kube::runtime::watcher::Event::InitApply(Instance {
-            metadata: ObjectMeta {
-                namespace: Some("namespace-a".to_string()),
-                name: Some("instance-1".to_string()),
-                owner_references: Some(vec![OwnerReference {
-                    api_version: Instance::api_version(&()).to_string(),
-                    block_owner_deletion: None,
-                    controller: Some(true),
-                    kind: "Configuration".to_string(),
-                    name: "config-1".to_string(),
-                    uid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
-                }]),
-                ..Default::default()
-            },
-            spec: InstanceSpec {
-                configuration_name: "config-1".to_string(),
-                cdi_name: "akri.sh/config-1=abcdef".to_string(),
-                capacity: 1,
-                broker_properties: HashMap::new(),
-                shared: true,
-                nodes: vec!["node-a".to_string()],
-                device_usage: Default::default(),
-            },
-        }));
-        writer.apply_watcher_event(&kube::runtime::watcher::Event::InitApply(Instance {
-            metadata: ObjectMeta {
-                namespace: Some("namespace-a".to_string()),
-                name: Some("instance-2".to_string()),
-                owner_references: Some(vec![OwnerReference {
-                    api_version: Instance::api_version(&()).to_string(),
-                    block_owner_deletion: None,
-                    controller: Some(true),
-                    kind: "Configuration".to_string(),
-                    name: "config-1".to_string(),
-                    uid: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
-                }]),
-                ..Default::default()
-            },
-            spec: InstanceSpec {
-                configuration_name: "config-1".to_string(),
-                cdi_name: "akri.sh/config-1=abcdef".to_string(),
-                capacity: 1,
-                broker_properties: HashMap::new(),
-                shared: true,
-                nodes: vec!["node-b".to_string()],
-                device_usage: Default::default(),
-            },
-        }));
-        writer.apply_watcher_event(&kube::runtime::watcher::Event::InitApply(Instance {
-            metadata: ObjectMeta {
-                namespace: Some("namespace-a".to_string()),
-                name: Some("instance-3".to_string()),
-                owner_references: Some(vec![OwnerReference {
-                    api_version: Instance::api_version(&()).to_string(),
-                    block_owner_deletion: None,
-                    controller: Some(true),
-                    kind: "Configuration".to_string(),
-                    name: "config-2".to_string(),
-                    uid: "11112233-4455-6677-8899-aabbccddeeff".to_string(),
-                }]),
-                ..Default::default()
-            },
-            spec: InstanceSpec {
-                configuration_name: "config-2".to_string(),
-                cdi_name: "akri.sh/config-2=abcdef".to_string(),
-                capacity: 1,
-                broker_properties: HashMap::new(),
-                shared: true,
-                nodes: vec!["node-a".to_string()],
-                device_usage: Default::default(),
-            },
-        }));
+        for instance in [
+            test_instance("instance-1", "config-1", CONFIG_1_UID, "node-a"),
+            test_instance("instance-2", "config-1", CONFIG_1_UID, "node-b"),
+            test_instance(
+                "instance-3",
+                "config-2",
+                "11112233-4455-6677-8899-aabbccddeeff",
+                "node-a",
+            ),
+        ] {
+            writer.apply_watcher_event(&kube::runtime::watcher::Event::InitApply(instance));
+        }
         writer.apply_watcher_event(&kube::runtime::watcher::Event::InitDone);
-        let mut client = MockDiscoveryConfigurationKubeClient::default();
-        let mut api = MockApi::new();
-        api.expect_add_finalizer().returning(|_, _| Ok(()));
-        client
-            .config
-            .expect_namespaced()
-            .return_once(|_| Box::new(api));
+        store
+    }
 
-        let mut instance_api = MockApi::new();
-        instance_api
-            .expect_delete()
-            .with(eq("instance-1"))
-            .returning(|_| Ok(itertools::Either::Right(Status::default())));
-        client
-            .instance
-            .expect_namespaced()
-            .return_once(|_| Box::new(instance_api));
+    const CONFIG_1_UID: &str = "00112233-4455-6677-8899-aabbccddeeff";
 
-        let mut registry = MockDiscoveryHandlerRegistry::new();
-        registry.expect_get_request().return_once(|_| None);
-        //TODO: check arguments here
-        registry
-            .expect_new_request()
-            .returning(|_, _, _, _, _, _| Ok(()));
-
-        let ctx = Arc::new(ControllerContext {
-            instances_cache: store,
-            dh_registry: Arc::new(registry),
-            client: Arc::new(client),
-            agent_identifier: "node-a".to_string(),
-            error_backoffs: Default::default(),
-        });
-
-        let dc = Arc::new(Configuration {
+    fn test_config_1(finalizers: Option<Vec<String>>) -> Arc<Configuration> {
+        Arc::new(Configuration {
             metadata: ObjectMeta {
                 name: Some("config-1".to_string()),
                 namespace: Some("namespace-a".to_string()),
-                uid: Some("00112233-4455-6677-8899-aabbccddeeff".to_string()),
+                uid: Some(CONFIG_1_UID.to_string()),
+                finalizers,
                 ..Default::default()
             },
             spec: ConfigurationSpec {
@@ -658,8 +615,136 @@ mod tests {
                 configuration_service_spec: None,
                 broker_properties: Default::default(),
             },
+        })
+    }
+
+    /// The first reconcile after an agent start creates the discovery request and must not
+    /// delete the node's Instances (upstream #853).
+    #[tokio::test]
+    async fn test_reconcile_no_request_keeps_instances() {
+        let mut client = MockDiscoveryConfigurationKubeClient::default();
+        let mut api = MockApi::new();
+        api.expect_add_finalizer().returning(|_, _| Ok(()));
+        client
+            .config
+            .expect_namespaced()
+            .return_once(|_| Box::new(api));
+        // No expectation on the Instance API: any delete or apply fails the test.
+
+        let mut registry = MockDiscoveryHandlerRegistry::new();
+        registry.expect_get_request().return_once(|_| None);
+        registry
+            .expect_new_request()
+            .returning(|_, _, _, _, _, _| Ok(()));
+
+        let ctx = Arc::new(ControllerContext {
+            instances_cache: test_instances_cache(),
+            dh_registry: Arc::new(registry),
+            client: Arc::new(client),
+            agent_identifier: "node-a".to_string(),
+            error_backoffs: Default::default(),
         });
 
-        assert!(reconcile(dc, ctx).await.is_ok());
+        assert!(reconcile(test_config_1(None), ctx).await.is_ok());
+    }
+
+    /// A reconcile before every discovery handler answered applies what is known and deletes nothing.
+    #[tokio::test]
+    async fn test_reconcile_unanswered_request_keeps_instances() {
+        let mut client = MockDiscoveryConfigurationKubeClient::default();
+        let mut instance_api = MockApi::new();
+        instance_api
+            .expect_apply()
+            .withf(|instance: &Instance, _: &str| instance.name_any() == "config-1-discovered")
+            .times(1)
+            .returning(|instance, _| Ok(instance));
+        client
+            .instance
+            .expect_namespaced()
+            .with(eq("namespace-a"))
+            .return_once(|_| Box::new(instance_api));
+
+        let mut request = MockDiscoveryHandlerRequest::new();
+        request
+            .expect_set_extra_device_properties()
+            .returning(|_| {});
+        request.expect_all_endpoints_answered().returning(|| false);
+        request.expect_get_instances().returning(|| {
+            Ok(vec![Instance {
+                metadata: ObjectMeta {
+                    name: Some("config-1-discovered".to_string()),
+                    ..Default::default()
+                },
+                spec: InstanceSpec {
+                    configuration_name: "config-1".to_string(),
+                    cdi_name: "akri.sh/config-1=discovered".to_string(),
+                    capacity: 0,
+                    broker_properties: HashMap::new(),
+                    shared: false,
+                    nodes: vec![],
+                    device_usage: Default::default(),
+                },
+            }])
+        });
+        let mut registry = MockDiscoveryHandlerRegistry::new();
+        registry
+            .expect_get_request()
+            .return_once(|_| Some(Arc::new(request)));
+
+        let ctx = Arc::new(ControllerContext {
+            instances_cache: test_instances_cache(),
+            dh_registry: Arc::new(registry),
+            client: Arc::new(client),
+            agent_identifier: "node-a".to_string(),
+            error_backoffs: Default::default(),
+        });
+
+        assert!(
+            reconcile(test_config_1(Some(vec!["node-a".to_string()])), ctx)
+                .await
+                .is_ok()
+        );
+    }
+
+    /// Once every discovery handler answered, Instances of this node that were not discovered are deleted.
+    #[tokio::test]
+    async fn test_reconcile_answered_request_deletes_missing_instances() {
+        let mut client = MockDiscoveryConfigurationKubeClient::default();
+        let mut instance_api = MockApi::new();
+        instance_api
+            .expect_delete()
+            .with(eq("instance-1"))
+            .times(1)
+            .returning(|_| Ok(itertools::Either::Right(Status::default())));
+        client
+            .instance
+            .expect_namespaced()
+            .with(eq("namespace-a"))
+            .return_once(|_| Box::new(instance_api));
+
+        let mut request = MockDiscoveryHandlerRequest::new();
+        request
+            .expect_set_extra_device_properties()
+            .returning(|_| {});
+        request.expect_all_endpoints_answered().returning(|| true);
+        request.expect_get_instances().returning(|| Ok(vec![]));
+        let mut registry = MockDiscoveryHandlerRegistry::new();
+        registry
+            .expect_get_request()
+            .return_once(|_| Some(Arc::new(request)));
+
+        let ctx = Arc::new(ControllerContext {
+            instances_cache: test_instances_cache(),
+            dh_registry: Arc::new(registry),
+            client: Arc::new(client),
+            agent_identifier: "node-a".to_string(),
+            error_backoffs: Default::default(),
+        });
+
+        assert!(
+            reconcile(test_config_1(Some(vec!["node-a".to_string()])), ctx)
+                .await
+                .is_ok()
+        );
     }
 }
