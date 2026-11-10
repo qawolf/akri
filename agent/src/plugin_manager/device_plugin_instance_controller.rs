@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::fmt::Display;
 use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -136,7 +136,7 @@ struct PartialInstanceSlotUsage {
 }
 
 struct InstanceDevicePlugin {
-    device: cdi::Device,
+    device: std::sync::RwLock<cdi::Device>,
     slots_status: Mutex<watch::Sender<Vec<DeviceUsage>>>,
     node_name: String,
     instance_name: String,
@@ -159,7 +159,7 @@ impl InstanceDevicePlugin {
     ) -> Result<Self, DevicePluginError> {
         let (slots_status, _) = watch::channel(construct_slots_vec(slots, capacity)?);
         Ok(Self {
-            device,
+            device: std::sync::RwLock::new(device),
             slots_status: Mutex::new(slots_status),
             node_name,
             instance_name: plugin_name,
@@ -168,6 +168,27 @@ impl InstanceDevicePlugin {
             instance_namespace: namespace,
             shared,
         })
+    }
+
+    fn current_device(&self) -> cdi::Device {
+        self.device.read().unwrap().clone()
+    }
+
+    /// Takes the newest discovered device when its device nodes changed, for example after a
+    /// USB re-enumeration (upstream #734). Pods allocated before keep their old answer.
+    fn refresh_device(&self, device: cdi::Device) -> bool {
+        let mut current = self.device.write().unwrap();
+        let old_nodes = device_node_paths(&current);
+        let new_nodes = device_node_paths(&device);
+        if old_nodes == new_nodes {
+            return false;
+        }
+        info!(
+            "Device nodes of Instance {} changed from {:?} to {:?}, new allocations use the new nodes",
+            self.instance_name, old_nodes, new_nodes
+        );
+        *current = device;
+        true
     }
 
     async fn update_slots(&self, slots: &HashMap<String, String>) -> Result<(), DevicePluginError> {
@@ -323,6 +344,21 @@ impl InstanceDevicePlugin {
     }
 }
 
+/// Container and host path of each device node, as a set: discovery does not keep their order.
+fn device_node_paths(device: &cdi::Device) -> BTreeSet<(String, String)> {
+    device
+        .container_edits
+        .device_nodes
+        .iter()
+        .map(|d| {
+            (
+                d.path.clone(),
+                d.host_path.clone().unwrap_or_else(|| d.path.clone()),
+            )
+        })
+        .collect()
+}
+
 #[allow(clippy::result_large_err)]
 fn instance_device_usage_to_device(
     device_name: &str,
@@ -417,7 +453,7 @@ impl InternalDevicePlugin for InstanceDevicePlugin {
                         tonic::Status::unknown("Unable to claim slot")
                     })?;
             }
-            container_responses.push(cdi_device_to_car(&self.device));
+            container_responses.push(cdi_device_to_car(&self.current_device()));
         }
         Ok(tonic::Response::new(AllocateResponse {
             container_responses,
@@ -698,7 +734,7 @@ impl InternalDevicePlugin for ConfigurationDevicePlugin {
                         .get(&dev)
                         .ok_or(tonic::Status::unknown("Invalid slot"))?
                         .clone();
-                    container_responses.push(cdi_device_to_car(&dp.device));
+                    container_responses.push(cdi_device_to_car(&dp.current_device()));
                     dp.claim_slot(
                         None,
                         DeviceUsage::Configuration {
@@ -888,6 +924,7 @@ pub async fn reconcile(
                 }
                 Some(plugin) => {
                     // TODO: Add a way to handle a change in the instance's capacity.
+                    plugin.refresh_device(device);
                     plugin.update_slots(&instance.spec.device_usage).await?;
                     plugin.clone()
                 }
@@ -1112,13 +1149,13 @@ mod tests {
         ]);
 
         let instance_plugin = Arc::new(InstanceDevicePlugin {
-            device: Device {
+            device: std::sync::RwLock::new(Device {
                 name: "my-device".to_owned(),
                 annotations: Default::default(),
                 container_edits: ContainerEdit {
                     ..Default::default()
                 },
-            },
+            }),
             slots_status: Mutex::new(s),
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
@@ -1174,13 +1211,13 @@ mod tests {
             DeviceUsage::Unused,
         ]);
         let instance_plugin = Arc::new(InstanceDevicePlugin {
-            device: Device {
+            device: std::sync::RwLock::new(Device {
                 name: "my-device".to_owned(),
                 annotations: Default::default(),
                 container_edits: ContainerEdit {
                     ..Default::default()
                 },
-            },
+            }),
             slots_status: Mutex::new(s),
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
@@ -1240,11 +1277,11 @@ mod tests {
         let dpm = DevicePluginManager::new("node-a".to_owned(), kube_client.clone(), Arc::new(dm));
         let (s, _) = watch::channel(vec![DeviceUsage::Node("node-a".to_owned())]);
         let instance_plugin = Arc::new(InstanceDevicePlugin {
-            device: Device {
+            device: std::sync::RwLock::new(Device {
                 name: "my-device".to_owned(),
                 annotations: Default::default(),
                 container_edits: Default::default(),
-            },
+            }),
             slots_status: Mutex::new(s),
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
@@ -1284,13 +1321,13 @@ mod tests {
             DeviceUsage::Unused,
         ]);
         let instance_plugin = Arc::new(InstanceDevicePlugin {
-            device: Device {
+            device: std::sync::RwLock::new(Device {
                 name: "my-device".to_owned(),
                 annotations: Default::default(),
                 container_edits: ContainerEdit {
                     ..Default::default()
                 },
-            },
+            }),
             slots_status: Mutex::new(s),
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
@@ -1393,13 +1430,13 @@ mod tests {
             DeviceUsage::Unused,
         ]);
         let instance_plugin = Arc::new(InstanceDevicePlugin {
-            device: Device {
+            device: std::sync::RwLock::new(Device {
                 name: "my-device".to_owned(),
                 annotations: Default::default(),
                 container_edits: ContainerEdit {
                     ..Default::default()
                 },
-            },
+            }),
             slots_status: Mutex::new(s),
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
@@ -1488,13 +1525,13 @@ mod tests {
             DeviceUsage::Unused,
         ]);
         let instance_plugin = Arc::new(InstanceDevicePlugin {
-            device: Device {
+            device: std::sync::RwLock::new(Device {
                 name: "my-device".to_owned(),
                 annotations: Default::default(),
                 container_edits: ContainerEdit {
                     ..Default::default()
                 },
-            },
+            }),
             slots_status: Mutex::new(s),
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
@@ -1711,6 +1748,160 @@ mod tests {
                     topology: None,
                 }]
             }
+        );
+    }
+
+    fn usb_device(nodes: &[&str]) -> Device {
+        Device {
+            name: "akri.sh/config-a-abcdef".to_owned(),
+            annotations: Default::default(),
+            container_edits: ContainerEdit {
+                env: nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, n)| format!("UDEV_DEVNODE_{i}={n}"))
+                    .collect(),
+                device_nodes: nodes
+                    .iter()
+                    .map(|n| cdi::DeviceNode {
+                        path: n.to_string(),
+                        host_path: Some(n.to_string()),
+                        permissions: Some("rwm".to_owned()),
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn plugin_with_free_slot(device: Device) -> InstanceDevicePlugin {
+        let mut kube_client = MockIntoApi::new();
+        kube_client.expect_namespaced().returning(|_| {
+            let mut api = MockApi::new();
+            api.expect_raw_patch().returning(|_, _, _| {
+                Ok(Instance {
+                    metadata: Default::default(),
+                    spec: InstanceSpec {
+                        configuration_name: "config-a".to_owned(),
+                        cdi_name: Default::default(),
+                        capacity: 1,
+                        broker_properties: Default::default(),
+                        shared: false,
+                        nodes: Default::default(),
+                        device_usage: Default::default(),
+                    },
+                })
+            });
+            Box::new(api)
+        });
+        InstanceDevicePlugin::new(
+            "node-a".to_owned(),
+            "instance-a".to_owned(),
+            "namespace-a".to_owned(),
+            device,
+            &HashMap::from([("instance-a-0".to_owned(), "".to_owned())]),
+            1,
+            false,
+            Arc::new(kube_client),
+        )
+        .unwrap()
+    }
+
+    // Upstream #734: after a USB re-enumeration, a new pod gets the new device node.
+    #[tokio::test]
+    async fn test_refresh_device_new_allocation_gets_new_node() {
+        let plugin = plugin_with_free_slot(usb_device(&["/dev/bus/usb/003/117"]));
+        assert!(plugin.refresh_device(usb_device(&["/dev/bus/usb/003/120"])));
+        let response = plugin
+            .allocate(Request::new(AllocateRequest {
+                container_requests: vec![ContainerAllocateRequest {
+                    devices_i_ds: vec!["instance-a-0".to_owned()],
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let car = &response.container_responses[0];
+        assert_eq!(
+            car.devices
+                .iter()
+                .map(|d| d.host_path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/dev/bus/usb/003/120"]
+        );
+        assert_eq!(
+            car.envs.get("UDEV_DEVNODE_0").map(String::as_str),
+            Some("/dev/bus/usb/003/120")
+        );
+        assert_eq!(
+            car.envs.get("UDEV_DEVNODE_0_ABCDEF").map(String::as_str),
+            Some("/dev/bus/usb/003/120")
+        );
+    }
+
+    // Discovery does not keep the node order: Android USB and tty nodes swap their labels.
+    #[tokio::test]
+    async fn test_refresh_device_ignores_node_order() {
+        let plugin = plugin_with_free_slot(usb_device(&["/dev/bus/usb/003/118", "/dev/ttyACM1"]));
+        assert!(!plugin.refresh_device(usb_device(&["/dev/ttyACM1", "/dev/bus/usb/003/118"])));
+        assert_eq!(
+            plugin.current_device(),
+            usb_device(&["/dev/bus/usb/003/118", "/dev/ttyACM1"])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_refreshes_device_of_existing_plugin() {
+        let mut dm = crate::device_manager::MockDeviceManager::new();
+        dm.expect_get()
+            .withf(|fqdn| fqdn == "akri.sh/config-a=abcdef")
+            .returning(|_| Some(usb_device(&["/dev/bus/usb/003/120"])));
+        let mut kube_client = MockIntoApi::new();
+        kube_client.expect_namespaced().returning(|_| {
+            let mut api = MockApi::new();
+            api.expect_add_finalizer().returning(|_, _| Ok(()));
+            Box::new(api)
+        });
+        let dpm = Arc::new(DevicePluginManager::new(
+            "node-a".to_owned(),
+            Arc::new(kube_client),
+            Arc::new(dm),
+        ));
+        let plugin = Arc::new(plugin_with_free_slot(usb_device(&["/dev/bus/usb/003/117"])));
+        dpm.instance_plugins
+            .lock()
+            .await
+            .insert("instance-a".to_owned(), plugin.clone());
+        dpm.configuration_plugins.lock().await.insert(
+            "config-a".to_owned(),
+            Arc::new(ConfigurationDevicePlugin::new(
+                "config-a".to_owned(),
+                "node-a".to_owned(),
+            )),
+        );
+        let instance = Instance {
+            metadata: ObjectMeta {
+                name: Some("instance-a".to_owned()),
+                namespace: Some("namespace-a".to_owned()),
+                ..Default::default()
+            },
+            spec: InstanceSpec {
+                configuration_name: "config-a".to_owned(),
+                cdi_name: "akri.sh/config-a=abcdef".to_owned(),
+                capacity: 1,
+                broker_properties: Default::default(),
+                shared: false,
+                nodes: vec!["node-a".to_owned()],
+                device_usage: HashMap::from([("instance-a-0".to_owned(), "node-a".to_owned())]),
+            },
+        };
+
+        reconcile(Arc::new(instance), dpm).await.unwrap();
+
+        assert_eq!(
+            plugin.current_device(),
+            usb_device(&["/dev/bus/usb/003/120"])
         );
     }
 }
