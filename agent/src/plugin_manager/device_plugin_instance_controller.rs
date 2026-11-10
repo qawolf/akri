@@ -141,6 +141,7 @@ struct InstanceDevicePlugin {
     node_name: String,
     instance_name: String,
     instance_namespace: String,
+    shared: bool,
     kube_client: Arc<dyn IntoApi<Instance>>,
     stopper: Stopper,
 }
@@ -153,6 +154,7 @@ impl InstanceDevicePlugin {
         device: cdi::Device,
         slots: &HashMap<String, String>,
         capacity: usize,
+        shared: bool,
         client: Arc<dyn IntoApi<Instance>>,
     ) -> Result<Self, DevicePluginError> {
         let (slots_status, _) = watch::channel(construct_slots_vec(slots, capacity)?);
@@ -164,6 +166,7 @@ impl InstanceDevicePlugin {
             kube_client: client,
             stopper: Stopper::new(),
             instance_namespace: namespace,
+            shared,
         })
     }
 
@@ -238,13 +241,21 @@ impl InstanceDevicePlugin {
             })
             .context("Could not create instance patch")?,
         );
-        api.raw_patch(
-            &self.instance_name,
-            &patch,
-            &PatchParams::apply(&format!("dp-{}", &self.node_name)),
-        )
-        .await
-        .map_err(|e| match e {
+        let pp = PatchParams::apply(&format!("dp-{}", &self.node_name));
+        let res = match api.raw_patch(&self.instance_name, &patch, &pp).await {
+            // Only this node claims slots of a local Instance, so another owner is a stale write
+            // (upstream #801: the controller's NotReady cleanup). Take the slot back.
+            Err(kube::Error::Api(ae)) if ae.code == 409 && !self.shared => {
+                warn!(
+                    "Taking slot {id} of local Instance {} back: {}",
+                    self.instance_name, ae.message
+                );
+                api.raw_patch(&self.instance_name, &patch, &pp.force())
+                    .await
+            }
+            res => res,
+        };
+        res.map_err(|e| match e {
             kube::Error::Api(ae) => match ae.code {
                 409 => {
                     trace!("Conflict on apply {ae:?}");
@@ -868,6 +879,7 @@ pub async fn reconcile(
                         device,
                         &instance.spec.device_usage,
                         instance.spec.capacity,
+                        instance.spec.shared,
                         ctx.kube_client.clone(),
                     )?);
                     serve_and_register_plugin(plugin.clone()).await?;
@@ -1032,6 +1044,7 @@ mod tests {
             },
             &HashMap::new(),
             3,
+            false,
             Arc::new(MockIntoApi::new()),
         )
         .unwrap();
@@ -1110,6 +1123,7 @@ mod tests {
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
             instance_namespace: "namespace-a".to_owned(),
+            shared: false,
             kube_client,
             stopper: stopper.clone(),
         });
@@ -1171,6 +1185,7 @@ mod tests {
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
             instance_namespace: "namespace-a".to_owned(),
+            shared: false,
             kube_client,
             stopper: stopper.clone(),
         });
@@ -1279,6 +1294,7 @@ mod tests {
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
             instance_namespace: "namespace-a".to_owned(),
+            shared: false,
             kube_client,
             stopper: stopper.clone(),
         });
@@ -1387,6 +1403,7 @@ mod tests {
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
             instance_namespace: "namespace-a".to_owned(),
+            shared: false,
             kube_client,
             stopper: stopper.clone(),
         });
@@ -1481,6 +1498,7 @@ mod tests {
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
             instance_namespace: "namespace-a".to_owned(),
+            shared: false,
             kube_client,
             stopper: stopper.clone(),
         });
@@ -1507,6 +1525,83 @@ mod tests {
         );
     }
 
+    fn conflict_error() -> kube::Error {
+        kube::Error::Api(kube::core::ErrorResponse {
+            status: "Failure".to_owned(),
+            message: "Apply failed with 1 conflict: conflict with \"unknown\"".to_owned(),
+            reason: "Conflict".to_owned(),
+            code: 409,
+        })
+    }
+
+    fn plugin_with_conflicting_slot(shared: bool) -> InstanceDevicePlugin {
+        let mut kube_client = MockIntoApi::new();
+        kube_client.expect_namespaced().returning(move |_| {
+            let mut api = MockApi::new();
+            api.expect_raw_patch()
+                .withf(|_, _, pp| !pp.force)
+                .times(1)
+                .returning(|_, _, _| Err(conflict_error()));
+            api.expect_raw_patch()
+                .withf(|name, _, pp| name == "instance-a" && pp.force)
+                .times(if shared { 0 } else { 1 })
+                .returning(|_, _, _| {
+                    Ok(Instance {
+                        metadata: Default::default(),
+                        spec: InstanceSpec {
+                            configuration_name: "config-a".to_owned(),
+                            cdi_name: Default::default(),
+                            capacity: 1,
+                            broker_properties: Default::default(),
+                            shared: false,
+                            nodes: Default::default(),
+                            device_usage: Default::default(),
+                        },
+                    })
+                });
+            Box::new(api)
+        });
+        InstanceDevicePlugin::new(
+            "node-a".to_owned(),
+            "instance-a".to_owned(),
+            "namespace-a".to_owned(),
+            Device {
+                name: "my-device".to_owned(),
+                annotations: Default::default(),
+                container_edits: Default::default(),
+            },
+            &HashMap::from([("instance-a-0".to_owned(), "".to_owned())]),
+            1,
+            shared,
+            Arc::new(kube_client),
+        )
+        .unwrap()
+    }
+
+    // Upstream #801: after the controller's NotReady cleanup another manager owns the slot as "".
+    #[tokio::test]
+    async fn test_claim_slot_local_instance_takes_slot_back_on_conflict() {
+        let plugin = plugin_with_conflicting_slot(false);
+        assert_eq!(
+            plugin
+                .claim_slot(Some(0), DeviceUsage::Node("node-a".to_owned()))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn test_claim_slot_shared_instance_keeps_conflict() {
+        let plugin = plugin_with_conflicting_slot(true);
+        assert!(matches!(
+            plugin
+                .claim_slot(Some(0), DeviceUsage::Node("node-a".to_owned()))
+                .await,
+            Err(DevicePluginError::SlotInUse)
+        ));
+    }
+
     #[tokio::test]
     async fn test_list_and_watch() {
         let kube_client = Arc::new(MockIntoApi::new());
@@ -1522,6 +1617,7 @@ mod tests {
                 },
                 &HashMap::from([("instance-a-1".to_owned(), "node-b".to_owned())]),
                 3,
+                false,
                 kube_client,
             )
             .unwrap(),
