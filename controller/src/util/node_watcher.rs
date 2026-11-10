@@ -32,6 +32,15 @@ enum NodeState {
     InstancesCleaned,
 }
 
+/// Why handle_node_disappearance runs
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Disappearance {
+    /// A previously Running Node is no longer Ready
+    NotReady,
+    /// The Node was deleted
+    Deleted,
+}
+
 /// This is used to handle Nodes disappearing.
 ///
 /// When a Node disappears, make sure that any Instance that
@@ -116,14 +125,22 @@ impl NodeWatcher {
                     e.insert(NodeState::Known);
                 } else {
                     // Node Modified
-                    self.call_handle_node_disappearance_if_needed(&node, kube_interface)
-                        .await?;
+                    self.call_handle_node_disappearance_if_needed(
+                        &node,
+                        Disappearance::NotReady,
+                        kube_interface,
+                    )
+                    .await?;
                 }
             }
             Event::Delete(node) => {
                 info!("handle_node - Deleted: {:?}", &node.metadata.name);
-                self.call_handle_node_disappearance_if_needed(&node, kube_interface)
-                    .await?;
+                self.call_handle_node_disappearance_if_needed(
+                    &node,
+                    Disappearance::Deleted,
+                    kube_interface,
+                )
+                .await?;
             }
             Event::Init => {
                 if *first_event {
@@ -146,6 +163,7 @@ impl NodeWatcher {
     async fn call_handle_node_disappearance_if_needed(
         &mut self,
         node: &Node,
+        reason: Disappearance,
         kube_interface: &impl KubeInterface,
     ) -> anyhow::Result<()> {
         let node_name = node.metadata.name.clone().unwrap();
@@ -171,7 +189,7 @@ impl NodeWatcher {
                 "call_handle_node_disappearance_if_needed - call handle_node_disappearance: {:?}",
                 &node.metadata.name
             );
-            self.handle_node_disappearance(&node_name, kube_interface)
+            self.handle_node_disappearance(&node_name, reason, kube_interface)
                 .await?;
             self.known_nodes
                 .insert(node_name, NodeState::InstancesCleaned);
@@ -206,19 +224,33 @@ impl NodeWatcher {
     /// This handles when a node disappears by clearing nodes from
     /// the nodes list and deviceUsage map and then trying 5 times to
     /// update the Instance.
+    ///
+    /// On NotReady, local (not shared) Instances are kept as they are: only
+    /// that node's agent uses them, and clearing their slots makes the
+    /// agent's next slot claim fail with a conflict (upstream #801).
     async fn handle_node_disappearance(
         &self,
         vanished_node_name: &str,
+        reason: Disappearance,
         kube_interface: &impl KubeInterface,
     ) -> anyhow::Result<()> {
-        trace!("handle_node_disappearance - enter vanished_node_name={vanished_node_name:?}",);
+        trace!(
+            "handle_node_disappearance - enter vanished_node_name={vanished_node_name:?} reason={reason:?}"
+        );
 
         let instances = kube_interface.get_instances().await?;
         trace!(
             "handle_node_disappearance - found {:?} instances",
             instances.items.len()
         );
+        let mut kept_local_instances = 0;
         for instance in instances.items {
+            if reason == Disappearance::NotReady && !instance.spec.shared {
+                if instance.spec.nodes.iter().any(|n| n == vanished_node_name) {
+                    kept_local_instances += 1;
+                }
+                continue;
+            }
             let instance_name = instance.metadata.name.clone().unwrap();
             let instance_namespace = instance.metadata.namespace.as_ref().ok_or_else(|| {
                 anyhow::anyhow!("Namespace not found for instance: {instance_name}")
@@ -264,6 +296,11 @@ impl NodeWatcher {
             }
         }
 
+        if kept_local_instances > 0 {
+            info!(
+                "handle_node_disappearance - node {vanished_node_name} is not ready: kept {kept_local_instances} local Instances"
+            );
+        }
         trace!("handle_node_disappearance - exit");
         Ok(())
     }
@@ -547,6 +584,74 @@ mod tests {
         )
     }
 
+    // Upstream #801: a NotReady blip must not clear a local Instance.
+    #[tokio::test]
+    async fn test_handle_node_modified_unready_keeps_local_instances() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let node_json = file::read_file_to_string("../test/json/node-a-not-ready.json");
+        let node: Node = serde_json::from_str(&node_json).unwrap();
+        let mut node_watcher = NodeWatcher::new();
+
+        // No update_instance expectation: any write fails the test.
+        let mut mock = MockKubeInterface::new();
+        config_for_tests::configure_get_instances(
+            &mut mock,
+            "../test/json/local-instance.json",
+            true,
+        );
+        node_watcher
+            .known_nodes
+            .insert(node.metadata.name.clone().unwrap(), NodeState::Running);
+        node_watcher
+            .handle_node(Event::Apply(node), &mock, &mut false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            &NodeState::InstancesCleaned,
+            node_watcher.known_nodes.get("node-a").unwrap()
+        )
+    }
+
+    #[tokio::test]
+    async fn test_handle_node_deleted_cleans_local_instances() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        let node_json = file::read_file_to_string("../test/json/node-a-not-ready.json");
+        let node: Node = serde_json::from_str(&node_json).unwrap();
+        let mut node_watcher = NodeWatcher::new();
+
+        let instance_json = file::read_file_to_string("../test/json/local-instance.json");
+        let kube_object_instance: Instance = serde_json::from_str(&instance_json).unwrap();
+        let mut instance = kube_object_instance.spec;
+        instance.nodes.clear();
+
+        let mut mock = MockKubeInterface::new();
+        configure_for_handle_node_disappearance(
+            &mut mock,
+            &HandleNodeDisappearance {
+                get_instances_result_file: "../test/json/local-instance.json",
+                get_instances_result_listify: true,
+                update_instance: Some(UpdateInstance {
+                    instance_to_update: instance,
+                    instance_name: "config-a-b494b6",
+                    instance_namespace: "config-a-namespace",
+                }),
+            },
+        );
+
+        node_watcher
+            .handle_node(Event::Delete(node), &mock, &mut false)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            &NodeState::InstancesCleaned,
+            node_watcher.known_nodes.get("node-a").unwrap()
+        )
+    }
+
     const LIST_PREFIX: &str = r#"
 {
     "apiVersion": "v1",
@@ -592,7 +697,7 @@ mod tests {
         let node_watcher = NodeWatcher::new();
         assert!(
             node_watcher
-                .handle_node_disappearance("foo-a", &mock)
+                .handle_node_disappearance("foo-a", Disappearance::NotReady, &mock)
                 .await
                 .is_err()
         );
