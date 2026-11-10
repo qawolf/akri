@@ -1,14 +1,17 @@
 [patch.crates-io]
 # Patch is still needed, using one from upstream PR for now, hosted on a fork of ours to help
 # with supply chain integrity.
-h2 = { git = 'https://github.com/project-akri/h2', branch = 'patch-authority'}
+# QA Wolf: a copy of project-akri/h2 at e01e8842a37bc3590228e9ab408fc1710018c031 (branch
+# `patch-authority`), without fixtures/, ci/ and .github/. See third-party/README.md.
+h2 = { path = 'third-party/h2' }
 
 [workspace]
+# The h2 copy is a patch, not a workspace member.
+exclude = ["third-party/h2"]
 members = [
     "shared", 
     "agent", 
     "controller", 
-    "samples/brokers/udev-video-broker", 
     "webhooks/validating/configuration",
     "discovery-utils", 
     "discovery-handlers/debug-echo", 
@@ -23,10 +26,10 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.13.8"
-edition = "2021"
+version = "0.14.0"
+edition = "2024"
 license = "Apache-2.0"
 homepage = "https://docs.akri.sh/"
 repository = "https://github.com/project-akri/akri"
-rust-version = "1.79"
+rust-version = "1.88"
 authors = ["The Akri Team"]

@@ -17,7 +17,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   # The rust image that wolf-ops' Dockerfile builds with.
-  RUST_TOOLCHAIN: 1.79.0
+  RUST_TOOLCHAIN: 1.88.0
 
 jobs:
   build-and-test:

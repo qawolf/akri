@@ -69,6 +69,7 @@ controller:
   # allowOnControlPlane dictates whether a toleration will be added to allow to Akri Controller 
   # to run on the control plane node
   allowOnControlPlane: true
+  tolerations: { }
   # nodeSelectors is the array of nodeSelectors used to target nodes for the Akri Controller to run on
   # This can be set from the helm command line using `--set controller.nodeSelectors.label="value"`
   nodeSelectors: {}
@@ -119,6 +120,7 @@ agent:
   # nodeSelectors is the array of nodeSelectors used to target nodes for the Akri Agent to run on
   # This can be set from the helm command line using `--set agent.nodeSelectors.label="value"`
   nodeSelectors: {}
+  tolerations: { }
   resources:
     # memoryRequest defines the minimum amount of RAM that must be available to this Pod
     # for it to be scheduled by the Kubernetes Scheduler
@@ -714,6 +716,9 @@ udev:
       # udevRules is the list of udev rules used to find instances created as a result of
       # applying this udev configuration
       udevRules:
+      # permissions is the list of Cgroups permissions of the device
+      # combination of r (read), w (write), m (modify)
+      permissions: rwm
     # capacity is the capacity for any instances created as a result of
     # applying this udev configuration
     capacity: 1
@@ -846,6 +851,10 @@ webhookConfiguration:
   # base64-encoded CA certificate (PEM) used by Kubernetes to validate the Webhook's certificate, if
   # unset, will generate a self-signed certificate valid for 100y
   caBundle: null
+  # ttlSecondsAfterFinished is the number of seconds to wait after the webhook has finished its job
+  # before the job is cleaned up. Set this to a non-zero value if your CD pipeline (e.g. ArgoCD) hangs and requires a longer
+  # TTL.
+  ttlSecondsAfterFinished: 0
   image:
     # repository is the Akri Webhook for Configurations image reference
     repository: ghcr.io/project-akri/akri/webhook-configuration
@@ -859,7 +868,7 @@ webhookConfiguration:
     # reference is the webhook-certgen image reference
     reference: registry.k8s.io/ingress-nginx/kube-webhook-certgen
     # tag is the webhook-certgen image tag
-    tag: v1.1.1
+    tag: v1.6.9
     # pullPolicy is the webhook-certgen pull policy
     pullPolicy: IfNotPresent
   # onlyOnControlPlane dictates whether the Akri Webhook will only run on nodes with 
@@ -871,6 +880,7 @@ webhookConfiguration:
   # nodeSelectors is the array of nodeSelectors used to target nodes for the Akri Webhook to run on
   # This can be set from the helm command line using `--set webhookConfiguration.nodeSelectors.label="value"`
   nodeSelectors: {}
+  tolerations: { }
   resources:
     # memoryRequest defines the minimum amount of RAM that must be available to this Pod
     # for it to be scheduled by the Kubernetes Scheduler
