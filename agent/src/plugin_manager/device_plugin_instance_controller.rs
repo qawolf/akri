@@ -1249,6 +1249,7 @@ mod tests {
             node_name: "node-a".to_owned(),
             instance_name: "instance-a".to_owned(),
             instance_namespace: "namespace-a".to_owned(),
+            shared: false,
             kube_client,
             stopper: Stopper::new(),
         });
