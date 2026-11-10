@@ -72,40 +72,59 @@ async fn get_used_slots() -> Result<HashSet<String>, anyhow::Error> {
     Ok(resources)
 }
 
+/// One reclaim pass. A slot that this agent holds but no pod uses (the kubelet does not list it) is stalled.
+/// Returns the slots stalled for at least `SLOT_GRACE_PERIOD` (with their start time), and the other stalled
+/// slots. Both sets use the kubelet device ids: `<instance>-<i>` and `<config>-<i>`.
+fn find_slots_to_free(
+    theoretical_slots: &HashSet<String>,
+    used_slots: &HashSet<String>,
+    stalled_slots: &HashMap<String, Instant>,
+    now: Instant,
+) -> (Vec<(String, Instant)>, HashMap<String, Instant>) {
+    let mut to_free = Vec::new();
+    let mut still_stalled = HashMap::new();
+    for slot in theoretical_slots.difference(used_slots) {
+        match stalled_slots.get(slot) {
+            Some(at) if now.saturating_duration_since(*at) >= SLOT_GRACE_PERIOD => {
+                to_free.push((slot.to_string(), *at))
+            }
+            Some(at) => {
+                still_stalled.insert(slot.to_string(), *at);
+            }
+            None => {
+                still_stalled.insert(slot.to_string(), now);
+            }
+        }
+    }
+    (to_free, still_stalled)
+}
+
 pub async fn start_reclaimer(dp_manager: Arc<DevicePluginManager>) {
     let mut stalled_slots: HashMap<String, Instant> = HashMap::new();
     loop {
         trace!("reclaiming unused slots - start");
         if let Ok(used_slots) = get_used_slots().await {
             let theoretical_slots = dp_manager.get_used_slots().await;
-            let mut new_stalled_slots: HashMap<String, Instant> = HashMap::new();
-            let reclaim_iteration_start = Instant::now();
-            for slot_to_reclaim in theoretical_slots.difference(&used_slots) {
-                // See if slot was already stalled at previous iteration
-                if let Some(at) = stalled_slots.get(slot_to_reclaim) {
-                    if reclaim_iteration_start.saturating_duration_since(*at) >= SLOT_GRACE_PERIOD {
-                        // Slot is stalled for more than grace period, free it
-                        trace!("freeing slot: {slot_to_reclaim}");
-                        if dp_manager
-                            .free_slot(slot_to_reclaim.to_string())
-                            .await
-                            .is_err()
-                        {
-                            warn!(
-                                "Failed to free slot {}, will try again in {}s",
-                                slot_to_reclaim,
-                                SLOT_RECLAIM_INTERVAL.as_secs()
-                            );
-                            // To try again we just keep the slot as stalled
-                            new_stalled_slots.insert(slot_to_reclaim.to_string(), at.to_owned());
-                        };
-                    } else {
-                        // Keep slot as stall
-                        new_stalled_slots.insert(slot_to_reclaim.to_string(), at.to_owned());
-                    }
+            let (to_free, mut new_stalled_slots) = find_slots_to_free(
+                &theoretical_slots,
+                &used_slots,
+                &stalled_slots,
+                Instant::now(),
+            );
+            for (slot_to_reclaim, at) in to_free {
+                if dp_manager.free_slot(slot_to_reclaim.clone()).await.is_err() {
+                    warn!(
+                        "Failed to free slot {}, will try again in {}s",
+                        slot_to_reclaim,
+                        SLOT_RECLAIM_INTERVAL.as_secs()
+                    );
+                    // To try again we just keep the slot as stalled
+                    new_stalled_slots.insert(slot_to_reclaim, at);
                 } else {
-                    // Mark slot as stall
-                    new_stalled_slots.insert(slot_to_reclaim.to_string(), reclaim_iteration_start);
+                    info!(
+                        "Freed slot {slot_to_reclaim}: no pod used it for {}s",
+                        SLOT_GRACE_PERIOD.as_secs()
+                    );
                 }
             }
             stalled_slots = new_stalled_slots;
@@ -113,5 +132,72 @@ pub async fn start_reclaimer(dp_manager: Arc<DevicePluginManager>) {
         tokio::select! {
             _ = tokio::time::sleep(SLOT_RECLAIM_INTERVAL) => {},
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids(v: &[&str]) -> HashSet<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_used_slot_is_never_freed() {
+        // Kubelet-style ids on both sides: a pod uses each slot.
+        let theoretical = ids(&["instance-a-0", "config-a-1"]);
+        let used = ids(&["instance-a-0", "config-a-1", "other-b-0"]);
+        let start = Instant::now();
+        let mut stalled = HashMap::new();
+        for pass in 0..5u32 {
+            let (to_free, s) = find_slots_to_free(
+                &theoretical,
+                &used,
+                &stalled,
+                start + SLOT_RECLAIM_INTERVAL * pass,
+            );
+            assert!(to_free.is_empty());
+            assert!(s.is_empty());
+            stalled = s;
+        }
+    }
+
+    #[test]
+    fn test_leaked_slot_is_freed_after_grace_period() {
+        let theoretical = ids(&["instance-a-0", "instance-b-0"]);
+        let used = ids(&["instance-b-0"]);
+        let start = Instant::now();
+
+        let (to_free, stalled) = find_slots_to_free(&theoretical, &used, &HashMap::new(), start);
+        assert!(to_free.is_empty());
+        assert_eq!(stalled, HashMap::from([("instance-a-0".to_owned(), start)]));
+
+        let (to_free, stalled) =
+            find_slots_to_free(&theoretical, &used, &stalled, start + SLOT_RECLAIM_INTERVAL);
+        assert!(to_free.is_empty());
+        assert_eq!(stalled.len(), 1);
+
+        let (to_free, stalled) =
+            find_slots_to_free(&theoretical, &used, &stalled, start + SLOT_GRACE_PERIOD);
+        assert_eq!(to_free, vec![("instance-a-0".to_owned(), start)]);
+        assert!(stalled.is_empty());
+    }
+
+    #[test]
+    fn test_slot_used_again_is_no_longer_stalled() {
+        let theoretical = ids(&["instance-a-0"]);
+        let start = Instant::now();
+        let (_, stalled) = find_slots_to_free(&theoretical, &ids(&[]), &HashMap::new(), start);
+        assert_eq!(stalled.len(), 1);
+        // A new pod got the slot before the grace period ended.
+        let (to_free, stalled) = find_slots_to_free(
+            &theoretical,
+            &ids(&["instance-a-0"]),
+            &stalled,
+            start + SLOT_GRACE_PERIOD,
+        );
+        assert!(to_free.is_empty());
+        assert!(stalled.is_empty());
     }
 }
