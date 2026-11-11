@@ -542,10 +542,16 @@ impl ConfigurationDevicePlugin {
         }
     }
     async fn add_plugin(&self, name: String, plugin: Arc<InstanceDevicePlugin>) {
-        self.instances
-            .write()
-            .await
-            .insert(name.to_owned(), plugin.clone());
+        {
+            let mut instances = self.instances.write().await;
+            // Every reconcile calls this: start the slot watcher once per plugin object.
+            if let Some(known) = instances.get(&name)
+                && Arc::ptr_eq(known, &plugin)
+            {
+                return;
+            }
+            instances.insert(name.to_owned(), plugin.clone());
+        }
         let node_name = self.node_name.clone();
         let slots_ref = self.slots.clone();
         let config_name = self.config_name.clone();
@@ -1903,5 +1909,95 @@ mod tests {
             plugin.current_device(),
             usb_device(&["/dev/bus/usb/003/120"])
         );
+    }
+
+    async fn slot_watchers(plugin: &InstanceDevicePlugin) -> usize {
+        plugin.slots_status.lock().await.receiver_count()
+    }
+
+    // Each reconcile of a known Instance used to start one more slot watcher task, which lived as
+    // long as the Instance: the agent's memory grew with every Instance event.
+    #[tokio::test]
+    async fn test_reconcile_starts_one_slot_watcher_per_plugin() {
+        let mut dm = crate::device_manager::MockDeviceManager::new();
+        dm.expect_get()
+            .returning(|_| Some(usb_device(&["/dev/bus/usb/003/117"])));
+        let mut kube_client = MockIntoApi::new();
+        kube_client.expect_namespaced().returning(|_| {
+            let mut api = MockApi::new();
+            api.expect_add_finalizer().returning(|_, _| Ok(()));
+            Box::new(api)
+        });
+        let dpm = Arc::new(DevicePluginManager::new(
+            "node-a".to_owned(),
+            Arc::new(kube_client),
+            Arc::new(dm),
+        ));
+        let plugin = Arc::new(plugin_with_free_slot(usb_device(&["/dev/bus/usb/003/117"])));
+        dpm.instance_plugins
+            .lock()
+            .await
+            .insert("instance-a".to_owned(), plugin.clone());
+        let config_plugin = Arc::new(ConfigurationDevicePlugin::new(
+            "config-a".to_owned(),
+            "node-a".to_owned(),
+        ));
+        dpm.configuration_plugins
+            .lock()
+            .await
+            .insert("config-a".to_owned(), config_plugin.clone());
+        let instance = Arc::new(Instance {
+            metadata: ObjectMeta {
+                name: Some("instance-a".to_owned()),
+                namespace: Some("namespace-a".to_owned()),
+                ..Default::default()
+            },
+            spec: InstanceSpec {
+                configuration_name: "config-a".to_owned(),
+                cdi_name: "akri.sh/config-a=abcdef".to_owned(),
+                capacity: 1,
+                broker_properties: Default::default(),
+                shared: false,
+                nodes: vec!["node-a".to_owned()],
+                device_usage: HashMap::from([("instance-a-0".to_owned(), "node-a".to_owned())]),
+            },
+        });
+
+        for _ in 0..5 {
+            reconcile(instance.clone(), dpm.clone()).await.unwrap();
+        }
+
+        assert_eq!(slot_watchers(&plugin).await, 1);
+        assert_eq!(config_plugin.instances.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_config_plugin_new_plugin_object_gets_own_watcher() {
+        let config_plugin =
+            ConfigurationDevicePlugin::new("config-a".to_owned(), "node-a".to_owned());
+        let first = Arc::new(plugin_with_free_slot(usb_device(&["/dev/bus/usb/003/117"])));
+        config_plugin
+            .add_plugin("instance-a".to_owned(), first.clone())
+            .await;
+        config_plugin
+            .add_plugin("instance-a".to_owned(), first.clone())
+            .await;
+        assert_eq!(slot_watchers(&first).await, 1);
+
+        // The Instance came back: a new plugin object with the same name.
+        let second = Arc::new(plugin_with_free_slot(usb_device(&["/dev/bus/usb/003/118"])));
+        config_plugin
+            .add_plugin("instance-a".to_owned(), second.clone())
+            .await;
+        assert_eq!(slot_watchers(&second).await, 1);
+        assert!(Arc::ptr_eq(
+            config_plugin
+                .instances
+                .read()
+                .await
+                .get("instance-a")
+                .unwrap(),
+            &second
+        ));
     }
 }
