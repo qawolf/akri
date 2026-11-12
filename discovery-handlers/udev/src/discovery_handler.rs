@@ -61,6 +61,14 @@ fn default_permissions() -> String {
     "rwm".to_string()
 }
 
+/// A device's nodes in a fixed order (device node path, then sysfs path). A `HashSet` gives a
+/// new order on each poll, so the `_<i>` properties and the device specs would change for no reason.
+fn sorted_nodes(paths: HashSet<DeviceProperties>) -> Vec<DeviceProperties> {
+    let mut paths: Vec<DeviceProperties> = paths.into_iter().collect();
+    paths.sort_by(|a, b| (&a.1, &a.0).cmp(&(&b.1, &b.0)));
+    paths
+}
+
 /// `DiscoveryHandlerImpl` discovers udev instances by parsing the udev rules in `discovery_handler_config.udev_rules`.
 pub struct DiscoveryHandlerImpl {
     register_sender: Option<mpsc::Sender<()>>,
@@ -131,7 +139,7 @@ impl DiscoveryHandler for DiscoveryHandlerImpl {
                     .map(|(id, paths)| {
                         let mut properties = HashMap::new();
                         let mut device_specs = Vec::new();
-                        for (i, (_, node)) in paths.into_iter().enumerate() {
+                        for (i, (_, node)) in sorted_nodes(paths).into_iter().enumerate() {
                             let property_suffix = if discovery_handler_config.group_recursive {
                                 format!("_{i}")
                             } else {
@@ -286,6 +294,24 @@ mod tests {
         match deserialize_discovery_details::<UdevDiscoveryDetails>(yaml) {
             Ok(_) => panic!("Expected error parsing invalid permissions"),
             Err(e) => assert!(e.to_string().contains("a valid permission combination")),
+        }
+    }
+
+    // An Android phone with `groupRecursive`: its USB node and its tty node.
+    #[test]
+    fn test_sorted_nodes_same_order_every_poll() {
+        let usb = (
+            "/devices/pci0000:00/usb3/3-1/3-1.2/3-1.2.4".to_string(),
+            Some("/dev/bus/usb/003/011".to_string()),
+        );
+        let tty = (
+            "/devices/pci0000:00/usb3/3-1/3-1.2/3-1.2.4/3-1.2.4:1.1/tty/ttyACM1".to_string(),
+            Some("/dev/ttyACM1".to_string()),
+        );
+        // Each new HashSet has its own random hash keys, so its order differs between sets.
+        for _ in 0..32 {
+            let paths = HashSet::from([tty.clone(), usb.clone()]);
+            assert_eq!(sorted_nodes(paths), vec![usb.clone(), tty.clone()]);
         }
     }
 }
