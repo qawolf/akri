@@ -899,9 +899,12 @@ pub async fn reconcile(
         {
             plugin.stop();
         }
-        api.remove_finalizer(&instance, &ctx.node_name)
-            .await
-            .map_err(|e| DevicePluginError::Other(e.into()))?;
+        // Every agent sees every Instance; skip the no-op apply when our finalizer is not there.
+        if instance.finalizers().contains(&ctx.node_name) {
+            api.remove_finalizer(&instance, &ctx.node_name)
+                .await
+                .map_err(|e| DevicePluginError::Other(e.into()))?;
+        }
     } else {
         let device = ctx.device_manager.get(&instance.spec.cdi_name).ok_or(
             DevicePluginError::UnknownDevice(instance.spec.cdi_name.to_owned()),
@@ -1999,5 +2002,93 @@ mod tests {
                 .unwrap(),
             &second
         ));
+    }
+
+    fn instance_with(nodes: &[&str], finalizers: &[&str], deleting: bool) -> Instance {
+        Instance {
+            metadata: ObjectMeta {
+                name: Some("instance-a".to_owned()),
+                namespace: Some("namespace-a".to_owned()),
+                finalizers: Some(finalizers.iter().map(|f| f.to_string()).collect()),
+                deletion_timestamp: deleting
+                    .then(|| serde_json::from_str("\"2026-11-12T00:00:00Z\"").unwrap()),
+                ..Default::default()
+            },
+            spec: InstanceSpec {
+                configuration_name: "config-a".to_owned(),
+                cdi_name: "akri.sh/config-a=abcdef".to_owned(),
+                capacity: 1,
+                broker_properties: Default::default(),
+                shared: false,
+                nodes: nodes.iter().map(|n| n.to_string()).collect(),
+                device_usage: Default::default(),
+            },
+        }
+    }
+
+    type Removes = Arc<std::sync::Mutex<Vec<(String, String)>>>;
+
+    // A plugin manager on node-a that records each remove_finalizer call.
+    fn dpm_recording_finalizer_removes() -> (Arc<DevicePluginManager>, Removes) {
+        let removes: Removes = Default::default();
+        let recorded = removes.clone();
+        let mut kube_client = MockIntoApi::new();
+        kube_client.expect_namespaced().returning(move |_| {
+            let recorded = recorded.clone();
+            let mut api = MockApi::new();
+            api.expect_remove_finalizer()
+                .returning(move |instance: &Instance, finalizer: &str| {
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((instance.name_any(), finalizer.to_owned()));
+                    Ok(())
+                });
+            Box::new(api)
+        });
+        let dpm = Arc::new(DevicePluginManager::new(
+            "node-a".to_owned(),
+            Arc::new(kube_client),
+            Arc::new(crate::device_manager::MockDeviceManager::new()),
+        ));
+        (dpm, removes)
+    }
+
+    // Every agent reconciles every Instance. It used to send a finalizer apply for each one,
+    // also when its finalizer was not there (a no-op API call).
+    #[tokio::test]
+    async fn test_reconcile_skips_finalizer_remove_when_absent() {
+        for instance in [
+            instance_with(&["node-b"], &["node-b"], false),
+            instance_with(&["node-b"], &["node-b"], true),
+            instance_with(&[], &[], false),
+        ] {
+            let (dpm, removes) = dpm_recording_finalizer_removes();
+            reconcile(Arc::new(instance), dpm).await.unwrap();
+            assert_eq!(*removes.lock().unwrap(), vec![]);
+        }
+    }
+
+    // The Instance is deleted or left this node: the agent still removes its own finalizer, so
+    // the Instance does not stay Terminating.
+    #[tokio::test]
+    async fn test_reconcile_removes_own_finalizer() {
+        for instance in [
+            instance_with(&["node-a"], &["node-a", "node-b"], true),
+            instance_with(&["node-b"], &["node-a", "node-b"], false),
+        ] {
+            let (dpm, removes) = dpm_recording_finalizer_removes();
+            let plugin = Arc::new(plugin_with_free_slot(usb_device(&["/dev/bus/usb/003/117"])));
+            dpm.instance_plugins
+                .lock()
+                .await
+                .insert("instance-a".to_owned(), plugin);
+            reconcile(Arc::new(instance), dpm.clone()).await.unwrap();
+            assert_eq!(
+                *removes.lock().unwrap(),
+                vec![("instance-a".to_owned(), "node-a".to_owned())]
+            );
+            assert!(dpm.instance_plugins.lock().await.is_empty());
+        }
     }
 }
